@@ -11,7 +11,9 @@
 #define LINE_H 10
 #define MARGIN 4
 
-enum { MODE_RACK, MODE_BROWSER, MODE_PARAMPICK };
+enum { MODE_RACK, MODE_BROWSER, MODE_PARAMPICK, MODE_SONGS };
+
+#define MAX_SONGS 128
 
 static const char *BUS_NAMES[JUCE_HOST_NUM_BUSES] = {"SEND 1", "SEND 2", "SEND 3", "MASTER"};
 
@@ -27,15 +29,82 @@ static struct {
   int params_bus, params_slot;       // slot whose params the picker edits
   int params_sel;                    // selected quick (0..2)
   int pick_sel, pick_scroll;         // parameter picker selection
-  bool loaded_once; // auto-load persisted state on first open
+  bool started;                      // initial auto-load of last song done
   int needs_redraw;
   SDL_Texture *texture;
-  char state_path[1024];
+  // --- Songs ---
+  char songs_dir[1024];
+  char cur_song[64];                 // current song name ("" = none)
+  char song_names[MAX_SONGS][64];    // browser list (without .xml)
+  int song_count, song_sel, song_scroll;
+  bool naming;                       // text-entry active (new song)
+  char name_buf[64];
+  int name_len;
 } g;
 
-static void state_path(char *out, size_t n) {
+static SDL_AtomicInt g_pending_song; // CC recall: 0 = none, N+1 = recall song N
+
+static void songs_dir_path(void) {
+  if (g.songs_dir[0])
+    return;
   const char *pref = SDL_GetPrefPath("", "m8c");
-  SDL_snprintf(out, n, "%shost_state.xml", pref ? pref : "");
+  SDL_snprintf(g.songs_dir, sizeof(g.songs_dir), "%ssongs", pref ? pref : "");
+  SDL_CreateDirectory(g.songs_dir);
+}
+
+static void song_path(const char *name, char *out, size_t n) {
+  songs_dir_path();
+  SDL_snprintf(out, n, "%s/%s.xml", g.songs_dir, name);
+}
+
+static void last_song_path(char *out, size_t n) {
+  const char *pref = SDL_GetPrefPath("", "m8c");
+  SDL_snprintf(out, n, "%slast_song.txt", pref ? pref : "");
+}
+
+static void write_last_song(void) {
+  char p[1024];
+  last_song_path(p, sizeof(p));
+  SDL_IOStream *io = SDL_IOFromFile(p, "w");
+  if (io) {
+    SDL_WriteIO(io, g.cur_song, SDL_strlen(g.cur_song));
+    SDL_CloseIO(io);
+  }
+}
+
+static void songs_refresh(void) {
+  songs_dir_path();
+  g.song_count = 0;
+  int count = 0;
+  char **files = SDL_GlobDirectory(g.songs_dir, "*.xml", 0, &count);
+  if (files) {
+    for (int i = 0; i < count && g.song_count < MAX_SONGS; i++) {
+      char nm[64];
+      SDL_snprintf(nm, sizeof(nm), "%s", files[i]);
+      char *dot = SDL_strrchr(nm, '.'); // strip .xml
+      if (dot) *dot = '\0';
+      if (nm[0])
+        SDL_snprintf(g.song_names[g.song_count++], 64, "%s", nm);
+    }
+    SDL_free(files);
+  }
+}
+
+// Save the current song (called on structural changes / close / quit).
+static void autosave(void) {
+  if (!g.cur_song[0])
+    return;
+  char p[1100];
+  song_path(g.cur_song, p, sizeof(p));
+  juce_host_save(p);
+}
+
+static void load_song(const char *name) {
+  char p[1100];
+  song_path(name, p, sizeof(p));
+  juce_host_load(p);
+  SDL_snprintf(g.cur_song, sizeof(g.cur_song), "%s", name);
+  write_last_song();
 }
 
 void plugin_rack_toggle_open(void) {
@@ -43,14 +112,52 @@ void plugin_rack_toggle_open(void) {
   if (g.is_open) {
     g.mode = MODE_RACK;
     g.focus = 0;
-    if (!g.loaded_once) {
-      state_path(g.state_path, sizeof(g.state_path));
-      juce_host_load(g.state_path);
-      g.loaded_once = true;
-    }
+  } else {
+    autosave(); // save current song on close
   }
   g.needs_redraw = 1;
 }
+
+// Polled from the main loop: do the one-time startup load + CC song recalls
+// (plugin instantiation must happen on the main thread).
+void plugin_rack_tick(void) {
+  if (!juce_host_is_active())
+    return;
+  if (!g.started) {
+    g.started = true;
+    char p[1024];
+    last_song_path(p, sizeof(p));
+    SDL_IOStream *io = SDL_IOFromFile(p, "r");
+    if (io) {
+      char nm[64] = {0};
+      size_t r = SDL_ReadIO(io, nm, sizeof(nm) - 1);
+      nm[r] = '\0';
+      SDL_CloseIO(io);
+      if (nm[0]) {
+        load_song(nm);
+        SDL_Log("plugin_rack: loaded last song '%s'", nm);
+      }
+    }
+  }
+  const int pend = SDL_GetAtomicInt(&g_pending_song);
+  if (pend > 0) {
+    SDL_SetAtomicInt(&g_pending_song, 0);
+    songs_refresh();
+    const int idx = pend - 1;
+    if (idx < g.song_count) {
+      load_song(g.song_names[idx]);
+      SDL_Log("plugin_rack: CC recalled song %d '%s'", idx, g.song_names[idx]);
+    }
+    g.needs_redraw = 1;
+  }
+}
+
+void plugin_rack_request_song(int index) {
+  if (index >= 0)
+    SDL_SetAtomicInt(&g_pending_song, index + 1);
+}
+
+void plugin_rack_shutdown(void) { autosave(); }
 
 bool plugin_rack_is_open(void) { return g.is_open; }
 
@@ -63,8 +170,57 @@ static void clamp_slot(void) {
   if (g.sel_slot[g.sel_bus] < 0) g.sel_slot[g.sel_bus] = 0;
 }
 
+// Begin/end text entry for naming a new song.
+static void start_naming(void) {
+  g.naming = true;
+  g.name_len = 0;
+  g.name_buf[0] = '\0';
+  SDL_StartTextInput(SDL_GetKeyboardFocus());
+}
+static void stop_naming(void) {
+  g.naming = false;
+  SDL_StopTextInput(SDL_GetKeyboardFocus());
+}
+
 void plugin_rack_handle_event(struct app_context *ctx, const SDL_Event *e) {
   (void)ctx;
+
+  // Text entry (new song name) intercepts everything while active.
+  if (g.naming) {
+    if (e->type == SDL_EVENT_TEXT_INPUT) {
+      for (const char *c = e->text.text; *c && g.name_len < (int)sizeof(g.name_buf) - 1; c++)
+        if (*c != '/' && *c != '\\' && (unsigned char)*c >= 32) // keep filename-safe
+          g.name_buf[g.name_len++] = *c;
+      g.name_buf[g.name_len] = '\0';
+      g.needs_redraw = 1;
+      return;
+    }
+    if (e->type == SDL_EVENT_KEY_DOWN) {
+      switch (e->key.scancode) {
+      case SDL_SCANCODE_BACKSPACE:
+        if (g.name_len > 0) g.name_buf[--g.name_len] = '\0';
+        break;
+      case SDL_SCANCODE_RETURN:
+        if (g.name_len > 0) {
+          SDL_snprintf(g.cur_song, sizeof(g.cur_song), "%s", g.name_buf);
+          autosave(); // writes current host state to the new song file
+          songs_refresh();
+          write_last_song();
+        }
+        stop_naming();
+        g.mode = MODE_SONGS;
+        break;
+      case SDL_SCANCODE_ESCAPE:
+        stop_naming();
+        break;
+      default:
+        break;
+      }
+      g.needs_redraw = 1;
+    }
+    return;
+  }
+
   if (e->type != SDL_EVENT_KEY_DOWN)
     return;
   const SDL_Scancode sc = e->key.scancode;
@@ -93,8 +249,10 @@ void plugin_rack_handle_event(struct app_context *ctx, const SDL_Event *e) {
       juce_host_scan();
       break;
     case SDL_SCANCODE_RETURN:
-      if (count > 0)
+      if (count > 0) {
         juce_host_bus_add(g.target_bus, g.browser_sel);
+        autosave();
+      }
       g.mode = MODE_RACK;
       break;
     case SDL_SCANCODE_ESCAPE:
@@ -120,12 +278,56 @@ void plugin_rack_handle_event(struct app_context *ctx, const SDL_Event *e) {
       break;
     case SDL_SCANCODE_RETURN:
       juce_host_slot_quick_assign(g.params_bus, g.params_slot, g.params_sel, g.pick_sel);
+      autosave();
       g.mode = MODE_RACK;
       g.focus = 1;
       break;
     case SDL_SCANCODE_ESCAPE:
       g.mode = MODE_RACK;
       g.focus = 1;
+      break;
+    default:
+      break;
+    }
+    return;
+  }
+
+  if (g.mode == MODE_SONGS) {
+    const int step = shift ? 10 : 1;
+    switch (sc) {
+    case SDL_SCANCODE_UP:
+      g.song_sel = (g.song_sel > step) ? g.song_sel - step : 0;
+      break;
+    case SDL_SCANCODE_DOWN:
+      g.song_sel += step;
+      if (g.song_sel > g.song_count - 1) g.song_sel = g.song_count - 1;
+      if (g.song_sel < 0) g.song_sel = 0;
+      break;
+    case SDL_SCANCODE_RETURN: // load selected song
+      if (g.song_sel >= 0 && g.song_sel < g.song_count) {
+        load_song(g.song_names[g.song_sel]);
+        g.mode = MODE_RACK;
+      }
+      break;
+    case SDL_SCANCODE_N: // new song (type a name)
+      start_naming();
+      break;
+    case SDL_SCANCODE_X:
+    case SDL_SCANCODE_DELETE:
+    case SDL_SCANCODE_BACKSPACE:
+      if (g.song_sel >= 0 && g.song_sel < g.song_count) {
+        char p[1100];
+        song_path(g.song_names[g.song_sel], p, sizeof(p));
+        SDL_RemovePath(p);
+        if (SDL_strcmp(g.song_names[g.song_sel], g.cur_song) == 0)
+          g.cur_song[0] = '\0';
+        songs_refresh();
+        if (g.song_sel >= g.song_count) g.song_sel = g.song_count - 1;
+        if (g.song_sel < 0) g.song_sel = 0;
+      }
+      break;
+    case SDL_SCANCODE_ESCAPE:
+      g.mode = MODE_RACK;
       break;
     default:
       break;
@@ -166,7 +368,7 @@ void plugin_rack_handle_event(struct app_context *ctx, const SDL_Event *e) {
     case SDL_SCANCODE_X:
     case SDL_SCANCODE_DELETE:
     case SDL_SCANCODE_BACKSPACE:
-      if (loaded) juce_host_slot_quick_assign(g.sel_bus, slot, g.params_sel, -1);
+      if (loaded) { juce_host_slot_quick_assign(g.sel_bus, slot, g.params_sel, -1); autosave(); }
       break;
     case SDL_SCANCODE_P:
     case SDL_SCANCODE_ESCAPE:
@@ -195,6 +397,7 @@ void plugin_rack_handle_event(struct app_context *ctx, const SDL_Event *e) {
     if (shift) { // Shift+Up = move the plugin up in the chain
       juce_host_bus_move(g.sel_bus, g.sel_slot[g.sel_bus], -1);
       if (g.sel_slot[g.sel_bus] > 0) g.sel_slot[g.sel_bus]--;
+      autosave();
     } else if (g.sel_slot[g.sel_bus] > 0) {
       g.sel_slot[g.sel_bus]--;
     }
@@ -205,6 +408,7 @@ void plugin_rack_handle_event(struct app_context *ctx, const SDL_Event *e) {
       if (g.sel_slot[g.sel_bus] < n - 1) {
         juce_host_bus_move(g.sel_bus, g.sel_slot[g.sel_bus], +1);
         g.sel_slot[g.sel_bus]++;
+        autosave();
       }
     } else {
       int cap = juce_host_bus_capacity(g.sel_bus);
@@ -238,6 +442,7 @@ void plugin_rack_handle_event(struct app_context *ctx, const SDL_Event *e) {
   case SDL_SCANCODE_B: {
     int s = g.sel_slot[g.sel_bus];
     juce_host_slot_set_bypass(g.sel_bus, s, !juce_host_slot_is_bypassed(g.sel_bus, s));
+    autosave();
     break;
   }
   case SDL_SCANCODE_X:
@@ -245,19 +450,29 @@ void plugin_rack_handle_event(struct app_context *ctx, const SDL_Event *e) {
   case SDL_SCANCODE_BACKSPACE:
     juce_host_bus_remove(g.sel_bus, g.sel_slot[g.sel_bus]);
     clamp_slot();
+    autosave();
     break;
   case SDL_SCANCODE_C: // cycle the lane's MIDI channel (0=off, 1..16)
     if (g.sel_bus < JUCE_HOST_NUM_SENDS) {
       int mc = (juce_host_bus_midi_channel(g.sel_bus) + 1) % 17;
       juce_host_bus_set_midi_channel(g.sel_bus, mc);
+      autosave();
     }
+    break;
+  case SDL_SCANCODE_O: // songs: load / new / delete
+    songs_refresh();
+    g.song_sel = 0;
+    g.song_scroll = 0;
+    g.mode = MODE_SONGS;
     break;
   case SDL_SCANCODE_S:
     juce_host_scan();
     break;
-  case SDL_SCANCODE_W:
-    state_path(g.state_path, sizeof(g.state_path));
-    juce_host_save(g.state_path);
+  case SDL_SCANCODE_W: // force-save the current song (or name a new one)
+    if (g.cur_song[0])
+      autosave();
+    else
+      start_naming();
     break;
   default:
     break;
@@ -283,7 +498,11 @@ static void render_rack(SDL_Renderer *rend, int tw, int th) {
   const int col_w = tw / JUCE_HOST_NUM_BUSES;
   const int chars = (col_w - 2) / (gx > 0 ? gx : 6);
 
-  inprint(rend, "PLUGIN RACKS", MARGIN, MARGIN, title, title);
+  {
+    char rt[80];
+    SDL_snprintf(rt, sizeof(rt), "PLUGIN RACKS  [%s]", g.cur_song[0] ? g.cur_song : "no song");
+    inprint(rend, rt, MARGIN, MARGIN, title, title);
+  }
 
   const int top = MARGIN + LINE_H + 2;
   for (int b = 0; b < JUCE_HOST_NUM_BUSES; b++) {
@@ -359,7 +578,7 @@ static void render_rack(SDL_Renderer *rend, int tw, int th) {
     inprint(rend, "Up/Dn=Q  L/R=value  Enter=assign  L=learn  X=clear  P/Esc=back", MARGIN,
             th - LINE_H, dim, 0);
   else
-    inprint(rend, "Arrows=nav  Sh+UpDn=move  A=add E=edit P=params B=byp X=del C=midi S=scan W=save",
+    inprint(rend, "Arrows=nav Sh+UpDn=move A=add E=edit P=params B=byp X=del C=midi O=songs S=scan W=save",
             MARGIN, th - LINE_H, dim, 0);
   char lat[48];
   SDL_snprintf(lat, sizeof(lat), "PDC: %d smp", juce_host_latency_samples());
@@ -434,6 +653,47 @@ static void render_parampick(SDL_Renderer *rend, int tw, int th) {
   inprint(rend, "Up/Down (Shift=fast)  Enter=assign  Esc=back", MARGIN, th - LINE_H, dim, 0);
 }
 
+static void render_songs(SDL_Renderer *rend, int tw, int th) {
+  const Uint32 fg = 0xFFFFFF, sel = 0x00FFFF, title = 0xFF0000, dim = 0x888888;
+  const int gx = (int)fonts_get(0)->glyph_x;
+
+  // Naming prompt for a new song.
+  if (g.naming) {
+    inprint(rend, "NEW SONG - type a name:", MARGIN, MARGIN, title, title);
+    char line[80];
+    SDL_snprintf(line, sizeof(line), "> %s_", g.name_buf);
+    inprint(rend, line, MARGIN, MARGIN + LINE_H * 2, sel, 0);
+    inprint(rend, "Enter=create  Esc=cancel", MARGIN, th - LINE_H, dim, 0);
+    return;
+  }
+
+  char head[80];
+  SDL_snprintf(head, sizeof(head), "SONGS  (%d)   current: %s", g.song_count,
+               g.cur_song[0] ? g.cur_song : "(none)");
+  inprint(rend, head, MARGIN, MARGIN, title, title);
+
+  if (g.song_count == 0)
+    inprint(rend, "No songs yet. Press N to create one.", MARGIN, MARGIN + LINE_H * 2, fg, 0);
+
+  const int top = MARGIN + LINE_H + 2;
+  const int rows = (th - top - LINE_H) / LINE_H;
+  if (g.song_sel < g.song_scroll) g.song_scroll = g.song_sel;
+  if (g.song_sel >= g.song_scroll + rows) g.song_scroll = g.song_sel - rows + 1;
+
+  const int maxchars = (tw - 2 * MARGIN) / (gx > 0 ? gx : 6);
+  for (int i = 0; i < rows; i++) {
+    int idx = g.song_scroll + i;
+    if (idx >= g.song_count) break;
+    char line[80];
+    trunc_copy(line, g.song_names[idx], maxchars);
+    const int y = top + i * LINE_H;
+    const bool selrow = (idx == g.song_sel);
+    if (selrow) hl_bar(rend, 0, y, tw);
+    inprint(rend, line, MARGIN, y, selrow ? 0x000000 : fg, 0);
+  }
+  inprint(rend, "Up/Dn  Enter=load  N=new  X=del  Esc=back", MARGIN, th - LINE_H, dim, 0);
+}
+
 void plugin_rack_render_overlay(SDL_Renderer *rend, int texture_w, int texture_h) {
   if (!g.is_open)
     return;
@@ -468,6 +728,8 @@ void plugin_rack_render_overlay(SDL_Renderer *rend, int texture_w, int texture_h
     render_browser(rend, texture_w, texture_h);
   else if (g.mode == MODE_PARAMPICK)
     render_parampick(rend, texture_w, texture_h);
+  else if (g.mode == MODE_SONGS)
+    render_songs(rend, texture_w, texture_h);
   else
     render_rack(rend, texture_w, texture_h);
 

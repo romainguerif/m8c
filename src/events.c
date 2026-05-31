@@ -98,6 +98,14 @@ SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
     input_handle_key_up_event(ctx, event);
     break;
 
+  case SDL_EVENT_TEXT_INPUT:
+    // Text entry for the plugin rack (naming a song).
+    if (plugin_rack_is_open()) {
+      plugin_rack_handle_event(ctx, event);
+      return ret_val;
+    }
+    break;
+
   case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
     if (settings_is_open()) {
       settings_handle_event(ctx, event);

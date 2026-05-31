@@ -18,6 +18,7 @@
 #include "backends/midi_cc.h"
 #include "backends/recorder.h"
 #include "juce_host.h"
+#include "plugin_rack.h"
 #include "common.h"
 #include "config.h"
 #include "gamepads.h"
@@ -110,7 +111,8 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
   struct app_context *ctx = appstate;
   SDL_AppResult app_result = SDL_APP_CONTINUE;
 
-  juce_host_pump(); // service the JUCE message loop (no-op on macOS for now)
+  juce_host_pump();    // service the JUCE message loop (no-op on macOS for now)
+  plugin_rack_tick();  // startup song auto-load + CC song recalls (main thread)
 
   // REC indicator in the window title, updated on the main thread only
   // (the recorder is armed/started from the realtime/MIDI thread).
@@ -237,6 +239,7 @@ void SDL_AppQuit(void *appstate, SDL_AppResult result) {
     if (app->app_state == WAIT_FOR_DEVICE) {
       screensaver_destroy();
     }
+    plugin_rack_shutdown(); // save current song while the host state is intact
     recorder_shutdown();
     midi_cc_close();
     juce_host_shutdown();

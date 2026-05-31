@@ -1,6 +1,7 @@
 // MIDI Control Change input for the recorder trigger.
 // Released under the MIT licence, https://opensource.org/licenses/MIT
 #include "midi_cc.h"
+#include "../plugin_rack.h"
 #include "juce_host.h"
 #include "recorder.h"
 
@@ -8,6 +9,8 @@
 
 // Send-amount CCs: channel 1-8 = M8 track, CC20/21/22 = send bus 0/1/2.
 #define SEND_CC_BASE 20
+// Song recall CC (any channel): value = song index to load.
+#define SONG_RECALL_CC 102
 
 #ifdef __APPLE__
 // ---------------------------------------------------------------------------
@@ -37,6 +40,10 @@ static void dispatch_channel_message(uint8_t status, uint8_t d0, uint8_t d1, int
     const int bus = cc - SEND_CC_BASE;
     if (bus >= 0 && bus < JUCE_HOST_NUM_SENDS && channel >= 1 && channel <= JUCE_HOST_NUM_TRACKS) {
       juce_host_set_send(channel - 1, bus, (float)value / 127.0f);
+    }
+    // Song recall: CC102 value = song index (applied on the main thread).
+    if (cc == SONG_RECALL_CC) {
+      plugin_rack_request_song(value);
     }
   }
 }
