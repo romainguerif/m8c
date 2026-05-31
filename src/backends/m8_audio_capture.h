@@ -23,5 +23,6 @@ void m8_capture_stop(void);
 // Negotiated format (valid after a successful start).
 int m8_capture_channels(void);
 int m8_capture_rate(void);
+int m8_capture_block_frames(void); // negotiated IOProc buffer size, or 0
 
 #endif
