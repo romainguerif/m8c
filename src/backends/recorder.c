@@ -44,12 +44,14 @@ static recorder_config_s cfg;
 // only used for the stereo master monitor output (SDL caps at 8 channels).
 static SDL_AudioStream *monitor_stream = NULL; // master (ch 1-2) -> output
 static bool capture_ready = false;
-static int channels = 0;
+static int channels = 0;       // M8 capture channels (24)
+static int rec_channels = 0;   // channels + 2 (extra stereo = processed master)
 static int sample_rate = 44100;
-static size_t frame_bytes = 0; // channels * (REC_BITS/8)
+static size_t frame_bytes = 0; // rec_channels * sizeof(float) in the ring
 
 static int16_t *monitor_tmp = NULL; // capture-thread scratch (stereo S16)
-static float *host_out = NULL;      // capture-thread scratch (stereo float)
+static float *host_out = NULL;      // capture-thread scratch (stereo float, wet master)
+static float *cap_combined = NULL;  // capture-thread scratch (rec_channels interleaved)
 
 // ---------------------------------------------------------------------------
 // Record-session state (lives while recording)
@@ -103,7 +105,12 @@ static bool mkpath(const char *path) {
 }
 
 static void track_filename(int idx, int total_files, char *out, size_t out_size) {
-  if (total_files == 12) { // 24-channel M8 layout
+  // The last file is always the processed (wet) master we add ourselves.
+  if (idx == total_files - 1) {
+    SDL_snprintf(out, out_size, "%02d_master_wet.wav", total_files);
+    return;
+  }
+  if (total_files == 13) { // 24-channel M8 layout + wet master
     if (idx == 0)
       SDL_snprintf(out, out_size, "01_master.wav");
     else if (idx >= 1 && idx <= 8)
@@ -114,8 +121,6 @@ static void track_filename(int idx, int total_files, char *out, size_t out_size)
       SDL_snprintf(out, out_size, "11_delay.wav");
     else
       SDL_snprintf(out, out_size, "12_reverb.wav");
-  } else if (total_files == 1) {
-    SDL_snprintf(out, out_size, "01_master.wav");
   } else {
     SDL_snprintf(out, out_size, "%02d_pair%d.wav", idx + 1, idx + 1);
   }
@@ -154,31 +159,42 @@ static inline int16_t f32_to_s16(float v) {
 static void recorder_on_frames(const float *src, int frames, int ch) {
   if (!capture_ready || frames <= 0)
     return;
+  const int nf = frames > MON_MAX_FRAMES ? MON_MAX_FRAMES : frames;
 
-  // Master monitor: route through the plugin host (3 sends + master) when
-  // active, else pass the M8 master pair (ch 0,1) straight through.
-  if (monitor_stream != NULL) {
-    int mf = frames > MON_MAX_FRAMES ? MON_MAX_FRAMES : frames;
-    if (juce_host_is_active()) {
-      juce_host_process(src, ch, mf, host_out); // interleaved stereo float
-      for (int i = 0; i < mf * 2; i++)
-        monitor_tmp[i] = f32_to_s16(host_out[i]);
-    } else {
-      for (int fr = 0; fr < mf; fr++) {
-        const float *f = src + (size_t)fr * ch;
-        monitor_tmp[2 * fr] = f32_to_s16(f[0]);
-        monitor_tmp[2 * fr + 1] = f32_to_s16(f[1]);
-      }
+  // Compute the processed (wet) master: 3 sends + master chain through the
+  // plugin host. Falls back to the M8 master pair (ch 0,1) when inactive.
+  const bool host = juce_host_is_active();
+  if (host) {
+    juce_host_process(src, ch, nf, host_out); // interleaved stereo float
+  } else {
+    for (int fr = 0; fr < nf; fr++) {
+      const float *f = src + (size_t)fr * ch;
+      host_out[2 * fr] = f[0];
+      host_out[2 * fr + 1] = f[1];
     }
-    SDL_PutAudioStreamData(monitor_stream, monitor_tmp, mf * 2 * (int)sizeof(int16_t));
   }
 
-  // Disk: push the full multichannel float frame block when recording.
+  // Master monitor: send the wet master back to the M8.
+  if (monitor_stream != NULL) {
+    for (int i = 0; i < nf * 2; i++)
+      monitor_tmp[i] = f32_to_s16(host_out[i]);
+    SDL_PutAudioStreamData(monitor_stream, monitor_tmp, nf * 2 * (int)sizeof(int16_t));
+  }
+
+  // Disk: record the raw 24 channels + the wet master (2 extra channels).
   if (SDL_GetAtomicInt(&recording)) {
-    const uint32_t bytes = (uint32_t)frames * (uint32_t)frame_bytes;
+    for (int fr = 0; fr < nf; fr++) {
+      float *dst = cap_combined + (size_t)fr * rec_channels;
+      const float *s = src + (size_t)fr * ch;
+      for (int c = 0; c < ch; c++)
+        dst[c] = s[c];
+      dst[ch] = host_out[2 * fr];
+      dst[ch + 1] = host_out[2 * fr + 1];
+    }
+    const uint32_t bytes = (uint32_t)nf * (uint32_t)frame_bytes;
     SDL_LockMutex(rb_lock);
     if (rb != NULL) {
-      const uint32_t pushed = ring_buffer_push(rb, (const uint8_t *)src, bytes);
+      const uint32_t pushed = ring_buffer_push(rb, (const uint8_t *)cap_combined, bytes);
       if (pushed == (uint32_t)-1 || pushed < bytes)
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "recorder: ring overflow (disk too slow?)");
     }
@@ -216,7 +232,7 @@ static int disk_thread_fn(void *data) {
       float peak = file_peak[f];
       size_t o = 0;
       for (int fr = 0; fr < frames; fr++) {
-        const float *frame = src + (size_t)fr * channels;
+        const float *frame = src + (size_t)fr * rec_channels;
         for (int lr = 0; lr < 2; lr++) {
           float v = frame[lr == 0 ? c0 : c1];
           float a = v < 0 ? -v : v;
@@ -243,7 +259,7 @@ static bool rec_begin(void) {
   if (SDL_GetAtomicInt(&recording) || !capture_ready)
     return SDL_GetAtomicInt(&recording);
 
-  num_files = channels / 2;
+  num_files = rec_channels / 2; // 12 M8 stems + 1 processed master
   if (num_files > REC_MAX_FILES)
     num_files = REC_MAX_FILES;
 
@@ -438,11 +454,14 @@ bool recorder_open_capture(void) {
     m8_capture_stop();
     return false;
   }
-  // The ring carries the captured float32 frames (converted to 24-bit on disk).
-  frame_bytes = (size_t)channels * sizeof(float);
+  // We record the 24 captured channels + a processed (wet) master stereo pair.
+  rec_channels = channels + 2;
+  // The ring carries float32 frames of rec_channels (converted to 24-bit on disk).
+  frame_bytes = (size_t)rec_channels * sizeof(float);
 
   monitor_tmp = SDL_malloc((size_t)MON_MAX_FRAMES * 2 * sizeof(int16_t));
   host_out = SDL_malloc((size_t)MON_MAX_FRAMES * 2 * sizeof(float));
+  cap_combined = SDL_malloc((size_t)MON_MAX_FRAMES * rec_channels * sizeof(float));
   rb_lock = SDL_CreateMutex();
 
   // Prepare the plugin host at the capture rate (max block headroom for HAL).
@@ -489,6 +508,10 @@ void recorder_close_capture(void) {
   if (host_out != NULL) {
     SDL_free(host_out);
     host_out = NULL;
+  }
+  if (cap_combined != NULL) {
+    SDL_free(cap_combined);
+    cap_combined = NULL;
   }
   st_armed = st_playing = st_manual = false;
 }

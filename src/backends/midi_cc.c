@@ -18,6 +18,8 @@
 static MIDIClientRef g_client = 0;
 static MIDIPortRef g_port = 0;
 static MIDIEndpointRef g_source = 0;
+static MIDIEndpointRef g_connected[64]; // sources already connected (hotplug)
+static int g_connected_count = 0;
 
 // Dispatch one complete channel-voice MIDI message: forward it to the plugin
 // host (so instruments play, routed by channel) and apply our arm/send CCs.
@@ -98,11 +100,44 @@ static bool source_name_matches_m8(MIDIEndpointRef src) {
   return SDL_strstr(buf, "M8") != NULL;
 }
 
+// Connect any MIDI source not already connected (M8 + hardware keyboards).
+// Called at open and on every CoreMIDI setup change (hotplug).
+static void connect_all_sources(void) {
+  if (g_port == 0)
+    return;
+  const ItemCount n = MIDIGetNumberOfSources();
+  for (ItemCount i = 0; i < n; i++) {
+    MIDIEndpointRef src = MIDIGetSource(i);
+    if (src == 0)
+      continue;
+    bool already = false;
+    for (int j = 0; j < g_connected_count; j++)
+      if (g_connected[j] == src) { already = true; break; }
+    if (already)
+      continue;
+    char name[128] = {0};
+    CFStringRef cn = NULL;
+    if (MIDIObjectGetStringProperty(src, kMIDIPropertyDisplayName, &cn) == noErr && cn) {
+      CFStringGetCString(cn, name, sizeof(name), kCFStringEncodingUTF8);
+      CFRelease(cn);
+    }
+    if (MIDIPortConnectSource(g_port, src, NULL) == noErr) {
+      if (g_connected_count < 64)
+        g_connected[g_connected_count++] = src;
+      SDL_Log("midi_cc: + source '%s'%s", name, source_name_matches_m8(src) ? " (M8)" : "");
+    }
+  }
+}
+
 bool midi_cc_open(void) {
   if (g_client != 0)
     return true;
 
-  OSStatus err = MIDIClientCreate(CFSTR("m8c"), NULL, NULL, &g_client);
+  // Notify block: reconnect sources when MIDI devices are plugged/unplugged.
+  OSStatus err = MIDIClientCreateWithBlock(CFSTR("m8c"), &g_client, ^(const MIDINotification *m) {
+    if (m != NULL && m->messageID == kMIDIMsgSetupChanged)
+      connect_all_sources();
+  });
   if (err != noErr) {
     SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "midi_cc: MIDIClientCreate failed (%d)", (int)err);
     return false;
@@ -118,47 +153,25 @@ bool midi_cc_open(void) {
     return false;
   }
 
-  // Connect ALL MIDI sources: the M8 (arm/transport/sends + its musical MIDI)
-  // and any hardware keyboard, so instruments can be played from either.
-  const ItemCount n = MIDIGetNumberOfSources();
-  int connected = 0;
-  for (ItemCount i = 0; i < n; i++) {
-    MIDIEndpointRef src = MIDIGetSource(i);
-    if (src == 0)
-      continue;
-    char name[128] = {0};
-    CFStringRef cn = NULL;
-    if (MIDIObjectGetStringProperty(src, kMIDIPropertyDisplayName, &cn) == noErr && cn) {
-      CFStringGetCString(cn, name, sizeof(name), kCFStringEncodingUTF8);
-      CFRelease(cn);
-    }
-    if (MIDIPortConnectSource(g_port, src, NULL) == noErr) {
-      connected++;
-      SDL_Log("midi_cc: connected source '%s'%s", name,
-              source_name_matches_m8(src) ? " (M8)" : "");
-    }
-  }
-  if (connected == 0) {
-    SDL_Log("midi_cc: no MIDI sources found");
-    midi_cc_close();
-    return false;
-  }
+  // Connect the M8 + any hardware keyboard already present. More can be added
+  // live via the notify block above (hotplug).
+  g_connected_count = 0;
+  connect_all_sources();
 
-  SDL_Log("midi_cc: listening on %d source(s) (arm CC %d, transport, instruments)", connected,
+  SDL_Log("midi_cc: listening (arm CC %d, transport, instruments; hotplug enabled)",
           recorder_arm_cc());
   return true;
 }
 
 void midi_cc_close(void) {
-  if (g_port != 0 && g_source != 0)
-    MIDIPortDisconnectSource(g_port, g_source);
   if (g_port != 0)
-    MIDIPortDispose(g_port);
+    MIDIPortDispose(g_port); // disconnects all connected sources
   if (g_client != 0)
     MIDIClientDispose(g_client);
   g_port = 0;
   g_client = 0;
   g_source = 0;
+  g_connected_count = 0;
 }
 
 #else
