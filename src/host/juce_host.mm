@@ -692,7 +692,7 @@ extern "C" void juce_host_push_midi(const unsigned char *data, int len) {
   juce::MidiMessage msg((const void *)data, len, 0.0);
   const int ch = msg.getChannel(); // 1-16, or 0 for non-channel messages
 
-  // Route notes/CC to instrument lanes on the matching channel (lock-free).
+  // Route notes/CC to instrument lanes on the matching channel (1-16; 0=off).
   for (int b = 0; b < JUCE_HOST_NUM_SENDS; b++) {
     if (g_buses[b].midi_channel != 0 && g_buses[b].midi_channel == ch) {
       std::lock_guard<std::mutex> mlk(g_buses[b].midi_mutex);
