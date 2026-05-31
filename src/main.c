@@ -17,6 +17,7 @@
 #include "backends/m8.h"
 #include "backends/midi_cc.h"
 #include "backends/recorder.h"
+#include "juce_host.h"
 #include "common.h"
 #include "config.h"
 #include "gamepads.h"
@@ -109,6 +110,8 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
   struct app_context *ctx = appstate;
   SDL_AppResult app_result = SDL_APP_CONTINUE;
 
+  juce_host_pump(); // service the JUCE message loop (no-op on macOS for now)
+
   switch (ctx->app_state) {
   case INITIALIZE:
     break;
@@ -183,6 +186,9 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     return SDL_APP_FAILURE;
   }
 
+  // Bring up the embedded JUCE host now that SDL/NSApp exists (main thread).
+  juce_host_init();
+
   ctx->device_connected =
       m8_initialize(1, ctx->preferred_device);
 
@@ -216,6 +222,7 @@ void SDL_AppQuit(void *appstate, SDL_AppResult result) {
     }
     recorder_shutdown();
     midi_cc_close();
+    juce_host_shutdown();
     if (app->conf.audio_enabled) {
       audio_close();
     }

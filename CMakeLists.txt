@@ -1,8 +1,15 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(m8c LANGUAGES C VERSION 2.2.4)
+project(m8c LANGUAGES C CXX VERSION 2.2.4)
+
+# The embedded JUCE plugin host adds C++ (and Obj-C++ on macOS).
+if (APPLE)
+    enable_language(OBJCXX)
+endif ()
 
 set(APP_NAME m8c)
+
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 option(USE_LIBSERIALPORT "Use libserialport as a backend" OFF)
 option(USE_LIBUSB "Use libusb as a backend" OFF)
@@ -73,6 +80,40 @@ endif ()
 if (APPLE)
     target_link_libraries(${APP_NAME} "-framework CoreMIDI" "-framework CoreAudio"
             "-framework CoreFoundation")
+endif ()
+
+# --- Embedded JUCE plugin host (VST/AU) -------------------------------------
+# Static C++/Obj-C++ library exposing a flat extern "C" API to the C app.
+# Lives in src/host/ which is intentionally NOT covered by the GLOB above, so
+# its .mm/.cpp never land in the C target.
+if (APPLE)
+    include(FetchJUCE)
+
+    add_library(m8c_juce_host STATIC src/host/juce_host.mm)
+    set_target_properties(m8c_juce_host PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+
+    target_compile_definitions(m8c_juce_host PRIVATE
+            JUCE_STANDALONE_APPLICATION=1
+            JUCE_MODAL_LOOPS_PERMITTED=1
+            JUCE_WEB_BROWSER=0
+            JUCE_USE_CURL=0
+            JUCE_PLUGINHOST_VST3=1
+            JUCE_PLUGINHOST_AU=1)
+
+    target_link_libraries(m8c_juce_host PRIVATE
+            juce::juce_core
+            juce::juce_events
+            juce::juce_data_structures
+            juce::juce_audio_basics
+            juce::juce_audio_processors
+            juce::juce_audio_formats
+            juce::juce_gui_basics
+            juce::juce_gui_extra
+            juce::juce_dsp
+            juce::juce_recommended_config_flags)
+
+    target_include_directories(${APP_NAME} PRIVATE src/host)
+    target_link_libraries(${APP_NAME} m8c_juce_host)
 endif ()
 
 if (APPLE)
