@@ -1,5 +1,6 @@
 #include "events.h"
 #include "backends/m8.h"
+#include "backends/m8_audio_capture.h"
 #include "common.h"
 #include "gamepads.h"
 #include "input.h"
@@ -78,6 +79,33 @@ SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
     // Toggle the plugin rack overlay (F3), then route to it when open.
     if (event->key.scancode == SDL_SCANCODE_F3 && event->key.repeat == 0) {
       plugin_rack_toggle_open();
+      return ret_val;
+    }
+
+    // Live audio buffer size: F9 = smaller (lower latency, for live playing),
+    // F10 = larger (more headroom, for full recording). Global; works even
+    // with the rack overlay open.
+    if ((event->key.scancode == SDL_SCANCODE_F9 ||
+         event->key.scancode == SDL_SCANCODE_F10) &&
+        event->key.repeat == 0) {
+      static const int ladder[] = {128, 256, 512, 1024, 2048};
+      const int n = (int)(sizeof(ladder) / sizeof(ladder[0]));
+      const int cur = m8_capture_block_frames();
+      int idx = 0;
+      for (int i = 0; i < n; i++)
+        if (cur >= ladder[i])
+          idx = i;
+      idx += (event->key.scancode == SDL_SCANCODE_F10) ? 1 : -1;
+      if (idx < 0)
+        idx = 0;
+      if (idx >= n)
+        idx = n - 1;
+      const int got = m8_capture_set_block_frames(ladder[idx]);
+      const int rate = m8_capture_rate();
+      char title[64];
+      SDL_snprintf(title, sizeof(title), "m8c  buffer %d smp (%.1f ms)", got,
+                   rate > 0 ? 1000.0 * got / rate : 0.0);
+      renderer_set_title(title);
       return ret_val;
     }
     if (plugin_rack_is_open()) {

@@ -18,6 +18,16 @@ int m8_capture_rate(void) { return g_rate; }
 int m8_capture_block_frames(void) { return g_block_frames; }
 
 #ifdef __APPLE__
+// Forward decl (defined in the CoreAudio section below).
+int m8_capture_set_block_frames(int frames);
+#else
+int m8_capture_set_block_frames(int frames) {
+  (void)frames;
+  return g_block_frames;
+}
+#endif
+
+#ifdef __APPLE__
 // ---------------------------------------------------------------------------
 // CoreAudio (HAL AudioDeviceIOProc) implementation
 // ---------------------------------------------------------------------------
@@ -28,6 +38,38 @@ static AudioDeviceIOProcID g_proc = NULL;
 static AudioStreamBasicDescription g_asbd;
 static float *g_scratch = NULL;     // interleaved float32 output
 static int g_scratch_frames = 0;
+
+// Set the IOProc buffer size (frames), clamped to the device's range. Safe to
+// call while the device is running (CoreAudio re-negotiates live). Returns the
+// value actually in effect.
+int m8_capture_set_block_frames(int frames) {
+  if (g_dev == kAudioObjectUnknown || frames <= 0)
+    return g_block_frames;
+  UInt32 want = (UInt32)frames;
+  AudioObjectPropertyAddress rng = {kAudioDevicePropertyBufferFrameSizeRange,
+                                    kAudioObjectPropertyScopeInput,
+                                    kAudioObjectPropertyElementMain};
+  AudioValueRange range = {0, 0};
+  UInt32 rsize = sizeof(range);
+  if (AudioObjectGetPropertyData(g_dev, &rng, 0, NULL, &rsize, &range) == noErr) {
+    if (want < (UInt32)range.mMinimum)
+      want = (UInt32)range.mMinimum;
+    if (want > (UInt32)range.mMaximum)
+      want = (UInt32)range.mMaximum;
+  }
+  AudioObjectPropertyAddress bfs = {kAudioDevicePropertyBufferFrameSize,
+                                    kAudioObjectPropertyScopeInput,
+                                    kAudioObjectPropertyElementMain};
+  AudioObjectSetPropertyData(g_dev, &bfs, 0, NULL, sizeof(want), &want);
+  UInt32 got = 0, gsize = sizeof(got);
+  if (AudioObjectGetPropertyData(g_dev, &bfs, 0, NULL, &gsize, &got) == noErr)
+    g_block_frames = (int)got;
+  else
+    g_block_frames = (int)want;
+  SDL_Log("m8_capture: IOProc buffer = %d frames (%.1f ms @ %d Hz)", g_block_frames,
+          g_rate > 0 ? 1000.0 * g_block_frames / g_rate : 0.0, g_rate);
+  return g_block_frames;
+}
 
 // Sum of input channels for a device (0 = not an input device).
 static int device_input_channels(AudioObjectID dev) {
@@ -176,7 +218,6 @@ bool m8_capture_start(m8_capture_cb cb) {
                                                                    : " (interleaved)");
 
   // Pin the IOProc buffer size for stable, predictable processing deadlines.
-  // Clamp the request to the device's supported range, then set it.
   {
     UInt32 want = M8_CAPTURE_BLOCK_FRAMES;
     const char *env = SDL_getenv("M8C_BLOCK");
@@ -185,29 +226,7 @@ bool m8_capture_start(m8_capture_cb cb) {
       if (v > 0)
         want = (UInt32)v;
     }
-    AudioObjectPropertyAddress rng = {kAudioDevicePropertyBufferFrameSizeRange,
-                                      kAudioObjectPropertyScopeInput,
-                                      kAudioObjectPropertyElementMain};
-    AudioValueRange range = {0, 0};
-    UInt32 rsize = sizeof(range);
-    if (AudioObjectGetPropertyData(g_dev, &rng, 0, NULL, &rsize, &range) == noErr) {
-      if (want < (UInt32)range.mMinimum)
-        want = (UInt32)range.mMinimum;
-      if (want > (UInt32)range.mMaximum)
-        want = (UInt32)range.mMaximum;
-    }
-    AudioObjectPropertyAddress bfs = {kAudioDevicePropertyBufferFrameSize,
-                                      kAudioObjectPropertyScopeInput,
-                                      kAudioObjectPropertyElementMain};
-    AudioObjectSetPropertyData(g_dev, &bfs, 0, NULL, sizeof(want), &want);
-    // Read back what the device actually accepted.
-    UInt32 got = 0, gsize = sizeof(got);
-    if (AudioObjectGetPropertyData(g_dev, &bfs, 0, NULL, &gsize, &got) == noErr)
-      g_block_frames = (int)got;
-    else
-      g_block_frames = (int)want;
-    SDL_Log("m8_capture: IOProc buffer = %d frames (%.1f ms @ %d Hz)", g_block_frames,
-            g_rate > 0 ? 1000.0 * g_block_frames / g_rate : 0.0, g_rate);
+    m8_capture_set_block_frames((int)want); // clamps, sets, logs, updates g_block_frames
   }
 
   OSStatus err = AudioDeviceCreateIOProcID(g_dev, io_proc, NULL, &g_proc);
