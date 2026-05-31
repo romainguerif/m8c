@@ -807,13 +807,19 @@ extern "C" bool juce_host_is_learning(void) { return g_learn_quick.load() >= 0; 
 // ===========================================================================
 // Realtime processing
 // ===========================================================================
-extern "C" bool juce_host_process(const float *in24, int channels, int frames, float *out) {
-  // Dry fallback: master pair = channels 0,1.
+// out: stereo master (interleaved). out_sends (or NULL): the 3 send wet outputs
+// interleaved as s1L,s1R,s2L,s2R,s3L,s3R (6 ch) — used by the recorder.
+extern "C" bool juce_host_process_full(const float *in24, int channels, int frames, float *out,
+                                       float *out_sends) {
+  // Dry fallback: master pair = channels 0,1; sends silent.
   auto passthrough = [&]() {
     for (int i = 0; i < frames; i++) {
       out[2 * i] = in24[i * channels + 0];
       out[2 * i + 1] = in24[i * channels + 1];
     }
+    if (out_sends)
+      for (int i = 0; i < frames * 2 * JUCE_HOST_NUM_SENDS; i++)
+        out_sends[i] = 0.0f;
   };
 
   std::unique_lock<std::mutex> lk(g_lock, std::try_to_lock);
@@ -863,6 +869,18 @@ extern "C" bool juce_host_process(const float *in24, int channels, int frames, f
     bus.align.process(bus.buf);
   }
 
+  // Tap each send's processed (aligned) wet output for the recorder.
+  if (out_sends) {
+    for (int b = 0; b < JUCE_HOST_NUM_SENDS; b++) {
+      const float *bl = g_buses[b].buf.getReadPointer(0);
+      const float *br = g_buses[b].buf.getReadPointer(1);
+      for (int i = 0; i < frames; i++) {
+        out_sends[i * 2 * JUCE_HOST_NUM_SENDS + b * 2] = bl[i];
+        out_sends[i * 2 * JUCE_HOST_NUM_SENDS + b * 2 + 1] = br[i];
+      }
+    }
+  }
+
   // Align dry to the longest send path, then sum into master input.
   g_dryDelay.setDelay(maxSend);
   g_dryDelay.process(g_dry);
@@ -886,6 +904,10 @@ extern "C" bool juce_host_process(const float *in24, int channels, int frames, f
     out[2 * i + 1] = mr[i];
   }
   return true;
+}
+
+extern "C" bool juce_host_process(const float *in24, int channels, int frames, float *out) {
+  return juce_host_process_full(in24, channels, frames, out, NULL);
 }
 
 // ===========================================================================

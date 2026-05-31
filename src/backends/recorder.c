@@ -51,6 +51,7 @@ static size_t frame_bytes = 0; // rec_channels * sizeof(float) in the ring
 
 static int16_t *monitor_tmp = NULL; // capture-thread scratch (stereo S16)
 static float *host_out = NULL;      // capture-thread scratch (stereo float, wet master)
+static float *host_sends = NULL;    // capture-thread scratch (3 sends interleaved = 6 ch)
 static float *cap_combined = NULL;  // capture-thread scratch (rec_channels interleaved)
 
 // ---------------------------------------------------------------------------
@@ -105,25 +106,21 @@ static bool mkpath(const char *path) {
 }
 
 static void track_filename(int idx, int total_files, char *out, size_t out_size) {
-  // The last file is always the processed (wet) master we add ourselves.
-  if (idx == total_files - 1) {
-    SDL_snprintf(out, out_size, "%02d_master_wet.wav", total_files);
-    return;
+  // 24-channel M8 layout: 12 dry stems + processed master + 3 processed sends.
+  if (total_files == 16) {
+    switch (idx) {
+    case 0: SDL_snprintf(out, out_size, "01_master.wav"); return;
+    case 9: SDL_snprintf(out, out_size, "10_modfx.wav"); return;
+    case 10: SDL_snprintf(out, out_size, "11_delay.wav"); return;
+    case 11: SDL_snprintf(out, out_size, "12_reverb.wav"); return;
+    case 12: SDL_snprintf(out, out_size, "13_master_wet.wav"); return;
+    case 13: SDL_snprintf(out, out_size, "14_send1_wet.wav"); return;
+    case 14: SDL_snprintf(out, out_size, "15_send2_wet.wav"); return;
+    case 15: SDL_snprintf(out, out_size, "16_send3_wet.wav"); return;
+    default: SDL_snprintf(out, out_size, "%02d_track%d.wav", idx + 1, idx); return; // 1-8
+    }
   }
-  if (total_files == 13) { // 24-channel M8 layout + wet master
-    if (idx == 0)
-      SDL_snprintf(out, out_size, "01_master.wav");
-    else if (idx >= 1 && idx <= 8)
-      SDL_snprintf(out, out_size, "%02d_track%d.wav", idx + 1, idx);
-    else if (idx == 9)
-      SDL_snprintf(out, out_size, "10_modfx.wav");
-    else if (idx == 10)
-      SDL_snprintf(out, out_size, "11_delay.wav");
-    else
-      SDL_snprintf(out, out_size, "12_reverb.wav");
-  } else {
-    SDL_snprintf(out, out_size, "%02d_pair%d.wav", idx + 1, idx + 1);
-  }
+  SDL_snprintf(out, out_size, "%02d_pair%d.wav", idx + 1, idx + 1);
 }
 
 static SDL_AudioDeviceID find_device(bool recording_dev, const char *match) {
@@ -165,13 +162,15 @@ static void recorder_on_frames(const float *src, int frames, int ch) {
   // plugin host. Falls back to the M8 master pair (ch 0,1) when inactive.
   const bool host = juce_host_is_active();
   if (host) {
-    juce_host_process(src, ch, nf, host_out); // interleaved stereo float
+    juce_host_process_full(src, ch, nf, host_out, host_sends); // master + 3 send wets
   } else {
     for (int fr = 0; fr < nf; fr++) {
       const float *f = src + (size_t)fr * ch;
       host_out[2 * fr] = f[0];
       host_out[2 * fr + 1] = f[1];
     }
+    for (int i = 0; i < nf * 2 * JUCE_HOST_NUM_SENDS; i++)
+      host_sends[i] = 0.0f;
   }
 
   // Master monitor: send the wet master back to the M8.
@@ -183,13 +182,16 @@ static void recorder_on_frames(const float *src, int frames, int ch) {
 
   // Disk: record the raw 24 channels + the wet master (2 extra channels).
   if (SDL_GetAtomicInt(&recording)) {
+    const int ns = 2 * JUCE_HOST_NUM_SENDS;
     for (int fr = 0; fr < nf; fr++) {
       float *dst = cap_combined + (size_t)fr * rec_channels;
       const float *s = src + (size_t)fr * ch;
       for (int c = 0; c < ch; c++)
         dst[c] = s[c];
-      dst[ch] = host_out[2 * fr];
-      dst[ch + 1] = host_out[2 * fr + 1];
+      dst[ch] = host_out[2 * fr];         // master wet L
+      dst[ch + 1] = host_out[2 * fr + 1]; // master wet R
+      for (int k = 0; k < ns; k++)        // send1/2/3 wet L/R
+        dst[ch + 2 + k] = host_sends[fr * ns + k];
     }
     const uint32_t bytes = (uint32_t)nf * (uint32_t)frame_bytes;
     SDL_LockMutex(rb_lock);
@@ -454,13 +456,14 @@ bool recorder_open_capture(void) {
     m8_capture_stop();
     return false;
   }
-  // We record the 24 captured channels + a processed (wet) master stereo pair.
-  rec_channels = channels + 2;
+  // Record: 24 captured channels + processed master (2) + 3 send wets (6).
+  rec_channels = channels + 2 + 2 * JUCE_HOST_NUM_SENDS;
   // The ring carries float32 frames of rec_channels (converted to 24-bit on disk).
   frame_bytes = (size_t)rec_channels * sizeof(float);
 
   monitor_tmp = SDL_malloc((size_t)MON_MAX_FRAMES * 2 * sizeof(int16_t));
   host_out = SDL_malloc((size_t)MON_MAX_FRAMES * 2 * sizeof(float));
+  host_sends = SDL_malloc((size_t)MON_MAX_FRAMES * 2 * JUCE_HOST_NUM_SENDS * sizeof(float));
   cap_combined = SDL_malloc((size_t)MON_MAX_FRAMES * rec_channels * sizeof(float));
   rb_lock = SDL_CreateMutex();
 
@@ -508,6 +511,10 @@ void recorder_close_capture(void) {
   if (host_out != NULL) {
     SDL_free(host_out);
     host_out = NULL;
+  }
+  if (host_sends != NULL) {
+    SDL_free(host_sends);
+    host_sends = NULL;
   }
   if (cap_combined != NULL) {
     SDL_free(cap_combined);

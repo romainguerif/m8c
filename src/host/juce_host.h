@@ -90,6 +90,12 @@ float juce_host_get_send(int track, int bus);
 // false if the caller should fall back to its own monitor path.
 bool juce_host_process(const float *in24, int channels, int frames, float *out_stereo);
 
+// Like juce_host_process, but also writes the 3 send buses' processed (wet)
+// outputs to out_sends (interleaved 6 ch: s1L,s1R,s2L,s2R,s3L,s3R). For the
+// multitrack recorder. out_sends may be NULL.
+bool juce_host_process_full(const float *in24, int channels, int frames, float *out_stereo,
+                            float *out_sends);
+
 // True once at least one chain has content or prepare succeeded (so the caller
 // knows to route monitoring through the host instead of its own path).
 bool juce_host_is_active(void);
