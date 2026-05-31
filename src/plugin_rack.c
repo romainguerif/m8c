@@ -60,9 +60,16 @@ static void clamp_slot(void) {
 
 void plugin_rack_handle_event(struct app_context *ctx, const SDL_Event *e) {
   (void)ctx;
-  if (e->type != SDL_EVENT_KEY_DOWN || e->key.repeat)
+  if (e->type != SDL_EVENT_KEY_DOWN)
     return;
   const SDL_Scancode sc = e->key.scancode;
+  const bool shift = (e->key.mod & SDL_KMOD_SHIFT) != 0;
+  // Allow key-repeat (hold to scroll) for navigation arrows only; one-shot
+  // actions (load, bypass, scan, ...) must not auto-repeat.
+  const bool is_nav = (sc == SDL_SCANCODE_UP || sc == SDL_SCANCODE_DOWN ||
+                       sc == SDL_SCANCODE_LEFT || sc == SDL_SCANCODE_RIGHT);
+  if (e->key.repeat && !is_nav)
+    return;
   g.needs_redraw = 1;
 
   if (g.mode == MODE_BROWSER) {
@@ -105,13 +112,25 @@ void plugin_rack_handle_event(struct app_context *ctx, const SDL_Event *e) {
     clamp_slot();
     break;
   case SDL_SCANCODE_UP:
-    if (g.sel_slot[g.sel_bus] > 0) g.sel_slot[g.sel_bus]--;
+    if (shift) { // Shift+Up = move the plugin up in the chain
+      juce_host_bus_move(g.sel_bus, g.sel_slot[g.sel_bus], -1);
+      if (g.sel_slot[g.sel_bus] > 0) g.sel_slot[g.sel_bus]--;
+    } else if (g.sel_slot[g.sel_bus] > 0) {
+      g.sel_slot[g.sel_bus]--;
+    }
     break;
   case SDL_SCANCODE_DOWN: {
     int n = juce_host_bus_slot_count(g.sel_bus);
-    int cap = juce_host_bus_capacity(g.sel_bus);
-    int max = (n < cap) ? n : cap - 1;
-    if (g.sel_slot[g.sel_bus] < max) g.sel_slot[g.sel_bus]++;
+    if (shift) { // Shift+Down = move the plugin down in the chain
+      if (g.sel_slot[g.sel_bus] < n - 1) {
+        juce_host_bus_move(g.sel_bus, g.sel_slot[g.sel_bus], +1);
+        g.sel_slot[g.sel_bus]++;
+      }
+    } else {
+      int cap = juce_host_bus_capacity(g.sel_bus);
+      int max = (n < cap) ? n : cap - 1;
+      if (g.sel_slot[g.sel_bus] < max) g.sel_slot[g.sel_bus]++;
+    }
     break;
   }
   case SDL_SCANCODE_RETURN:
@@ -141,15 +160,6 @@ void plugin_rack_handle_event(struct app_context *ctx, const SDL_Event *e) {
   case SDL_SCANCODE_DELETE:
   case SDL_SCANCODE_BACKSPACE:
     juce_host_bus_remove(g.sel_bus, g.sel_slot[g.sel_bus]);
-    clamp_slot();
-    break;
-  case SDL_SCANCODE_LEFTBRACKET:
-    juce_host_bus_move(g.sel_bus, g.sel_slot[g.sel_bus], -1);
-    if (g.sel_slot[g.sel_bus] > 0) g.sel_slot[g.sel_bus]--;
-    break;
-  case SDL_SCANCODE_RIGHTBRACKET:
-    juce_host_bus_move(g.sel_bus, g.sel_slot[g.sel_bus], +1);
-    g.sel_slot[g.sel_bus]++;
     clamp_slot();
     break;
   case SDL_SCANCODE_S:
@@ -206,7 +216,7 @@ static void render_rack(SDL_Renderer *rend, int tw, int th) {
   // Footer hints.
   char foot[160];
   SDL_snprintf(foot, sizeof(foot),
-               "Arrows=nav  A/Enter=add/edit  E=editor  B=bypass  X=del  []=move  S=scan  W=save");
+               "Arrows=nav  Shift+Up/Dn=move  A/Enter=add/edit  E=editor  B=bypass  X=del  S=scan  W=save");
   inprint(rend, foot, MARGIN, th - LINE_H, dim, 0);
   char lat[48];
   SDL_snprintf(lat, sizeof(lat), "PDC: %d smp", juce_host_latency_samples());
