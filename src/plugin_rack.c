@@ -77,12 +77,15 @@ void plugin_rack_handle_event(struct app_context *ctx, const SDL_Event *e) {
 
   if (g.mode == MODE_BROWSER) {
     const int count = juce_host_known_count();
+    const int step = shift ? 20 : 1; // Shift = fast scroll
     switch (sc) {
     case SDL_SCANCODE_UP:
-      if (g.browser_sel > 0) g.browser_sel--;
+      g.browser_sel = (g.browser_sel > step) ? g.browser_sel - step : 0;
       break;
     case SDL_SCANCODE_DOWN:
-      if (g.browser_sel < count - 1) g.browser_sel++;
+      g.browser_sel += step;
+      if (g.browser_sel > count - 1) g.browser_sel = count - 1;
+      if (g.browser_sel < 0) g.browser_sel = 0;
       break;
     case SDL_SCANCODE_S:
       juce_host_scan();
@@ -139,12 +142,15 @@ void plugin_rack_handle_event(struct app_context *ctx, const SDL_Event *e) {
 
   if (g.mode == MODE_PARAMPICK) {
     const int pc = juce_host_slot_param_count(g.params_bus, g.params_slot);
+    const int step = shift ? 20 : 1; // Shift = fast scroll
     switch (sc) {
     case SDL_SCANCODE_UP:
-      if (g.pick_sel > 0) g.pick_sel--;
+      g.pick_sel = (g.pick_sel > step) ? g.pick_sel - step : 0;
       break;
     case SDL_SCANCODE_DOWN:
-      if (g.pick_sel < pc - 1) g.pick_sel++;
+      g.pick_sel += step;
+      if (g.pick_sel > pc - 1) g.pick_sel = pc - 1;
+      if (g.pick_sel < 0) g.pick_sel = 0;
       break;
     case SDL_SCANCODE_RETURN:
       juce_host_slot_quick_assign(g.params_bus, g.params_slot, g.params_sel, g.pick_sel);
@@ -352,7 +358,7 @@ static void render_browser(SDL_Renderer *rend, int tw, int th) {
     inprint(rend, line, MARGIN, y, selrow ? 0x000000 : fg, 0);
   }
 
-  inprint(rend, "Up/Down  Enter=load  Esc=back  S=rescan", MARGIN, th - LINE_H, dim, 0);
+  inprint(rend, "Up/Down (Shift=fast)  Enter=load  Esc=back  S=rescan", MARGIN, th - LINE_H, dim, 0);
 }
 
 static void render_params(SDL_Renderer *rend, int tw, int th) {
@@ -413,7 +419,7 @@ static void render_parampick(SDL_Renderer *rend, int tw, int th) {
     if (selrow) hl_bar(rend, 0, y, tw);
     inprint(rend, line, MARGIN, y, selrow ? 0x000000 : fg, 0);
   }
-  inprint(rend, "Up/Down  Enter=assign  Esc=back", MARGIN, th - LINE_H, dim, 0);
+  inprint(rend, "Up/Down (Shift=fast)  Enter=assign  Esc=back", MARGIN, th - LINE_H, dim, 0);
 }
 
 void plugin_rack_render_overlay(SDL_Renderer *rend, int texture_w, int texture_h) {
