@@ -58,10 +58,18 @@ static void parse_midi_bytes(const uint8_t *data, int len) {
     if (b & 0x80) {
       // Real-time (0xF8-0xFF) may interleave without breaking running status.
       if (b >= 0xF8) {
-        if (b == 0xFA || b == 0xFB)
-          recorder_set_playing(true); // transport Start/Continue
-        else if (b == 0xFC)
-          recorder_set_playing(false); // transport Stop
+        if (b == 0xF8) {
+          juce_host_clock(); // MIDI clock pulse -> derive tempo for plugins
+        } else if (b == 0xFA) {
+          juce_host_transport(true, true); // Start: play from 0
+          recorder_set_playing(true);
+        } else if (b == 0xFB) {
+          juce_host_transport(true, false); // Continue: play, keep position
+          recorder_set_playing(true);
+        } else if (b == 0xFC) {
+          juce_host_transport(false, false); // Stop
+          recorder_set_playing(false);
+        }
         continue;
       }
       const uint8_t hi = b & 0xF0;

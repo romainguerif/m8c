@@ -118,6 +118,29 @@ juce::AudioBuffer<float> g_plugin_scratch;
 
 std::vector<std::unique_ptr<juce::DocumentWindow>> g_editorWindows;
 
+// ---- Transport / tempo from the M8 (MIDI clock + start/stop) ----
+std::atomic<double> g_bpm{120.0};       // derived from MIDI clock (0xF8)
+std::atomic<int> g_playing{0};          // transport running
+std::atomic<double> g_ppq{0.0};         // quarter-note position (advanced on audio thread)
+std::atomic<long long> g_time_samples{0};
+
+// Shared play head handed to every hosted plugin so tempo-synced effects and
+// transport-aware plugins (e.g. BassRoom) follow the M8.
+struct HostPlayHead : public juce::AudioPlayHead {
+  juce::Optional<PositionInfo> getPosition() const override {
+    PositionInfo p;
+    p.setBpm(g_bpm.load());
+    p.setTimeSignature(juce::AudioPlayHead::TimeSignature{4, 4});
+    p.setIsPlaying(g_playing.load() != 0);
+    p.setIsRecording(false);
+    p.setPpqPosition(g_ppq.load());
+    p.setTimeInSamples(g_time_samples.load());
+    p.setTimeInSeconds((double)g_time_samples.load() / (g_sr > 0 ? g_sr : 44100.0));
+    return p;
+  }
+};
+HostPlayHead g_playhead;
+
 // ---- helpers (must hold g_lock) ----
 void recompute_latency_locked() {
   int maxSend = 0;
@@ -137,6 +160,7 @@ void recompute_latency_locked() {
 
 void prepare_plugin_locked(Slot &s) {
   if (!s.plugin) return;
+  s.plugin->setPlayHead(&g_playhead); // tempo + transport from the M8
   // Force a plain stereo in/out layout (do NOT enableAllBuses: that can turn on
   // sidechain/aux input buses the host won't feed, which crashes some AUs).
   s.plugin->setPlayConfigDetails(2, 2, g_sr, g_maxBlock);
@@ -805,6 +829,35 @@ extern "C" void juce_host_begin_learn(int bus, int slot, int quick) {
 extern "C" bool juce_host_is_learning(void) { return g_learn_quick.load() >= 0; }
 
 // ===========================================================================
+// Transport / tempo (driven by the M8's MIDI clock + start/stop)
+// ===========================================================================
+// One MIDI clock pulse (0xF8): 24 per quarter note -> derive BPM from timing.
+extern "C" void juce_host_clock(void) {
+  static double last_ms = 0.0;
+  static double ema = 0.0; // smoothed ms per clock
+  const double now = juce::Time::getMillisecondCounterHiRes();
+  if (last_ms > 0.0) {
+    const double dt = now - last_ms;
+    if (dt > 1.0 && dt < 200.0) { // ignore startup/outliers
+      ema = (ema <= 0.0) ? dt : (ema * 0.85 + dt * 0.15);
+      const double bpm = 60000.0 / (ema * 24.0);
+      if (bpm > 20.0 && bpm < 400.0)
+        g_bpm.store(bpm);
+    }
+  }
+  last_ms = now;
+}
+
+// Transport: start (reset=true), continue (reset=false), or stop.
+extern "C" void juce_host_transport(bool playing, bool reset) {
+  g_playing.store(playing ? 1 : 0);
+  if (reset) {
+    g_ppq.store(0.0);
+    g_time_samples.store(0);
+  }
+}
+
+// ===========================================================================
 // Realtime processing
 // ===========================================================================
 // out: stereo master (interleaved). out_sends (or NULL): the 3 send wet outputs
@@ -828,6 +881,15 @@ extern "C" bool juce_host_process_full(const float *in24, int channels, int fram
     return true;
   }
   if (frames > g_maxBlock) frames = g_maxBlock;
+
+  // Advance the play head. The play head is the shared (input-side) transport
+  // for every lane; per-plugin latency is handled separately by the PDC delay
+  // lines, so tempo/transport stay consistent regardless of PDC.
+  g_time_samples.fetch_add(frames);
+  if (g_playing.load()) {
+    const double ppqPerSample = g_bpm.load() / 60.0 / (g_sr > 0 ? g_sr : 44100.0);
+    g_ppq.store(g_ppq.load() + frames * ppqPerSample);
+  }
 
   // Dry = master pair (ch 0,1).
   g_dry.setSize(2, frames, false, false, true);
