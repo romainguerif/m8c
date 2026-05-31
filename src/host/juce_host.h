@@ -51,6 +51,16 @@ void juce_host_slot_set_bypass(int bus, int slot, bool bypassed);
 bool juce_host_slot_is_bypassed(int bus, int slot);
 void juce_host_slot_open_editor(int bus, int slot); // native plugin GUI window
 
+// Per-lane MIDI input channel (1-16, or 0 = no MIDI). Lets a lane host an
+// instrument played by MIDI arriving on that channel (from the M8 or a
+// hardware keyboard). Master bus ignores MIDI.
+int  juce_host_bus_midi_channel(int bus);
+void juce_host_bus_set_midi_channel(int bus, int channel);
+
+// Feed a raw MIDI message (from any source) to the host; routed by channel to
+// matching lanes. Called from the MIDI thread.
+void juce_host_push_midi(const unsigned char *data, int len);
+
 // Total compensated output latency (samples), for info/UI.
 int  juce_host_latency_samples(void);
 

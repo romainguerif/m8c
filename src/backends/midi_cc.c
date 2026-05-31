@@ -19,60 +19,60 @@ static MIDIClientRef g_client = 0;
 static MIDIPortRef g_port = 0;
 static MIDIEndpointRef g_source = 0;
 
-// Parse a run of raw MIDI bytes, tracking running status. Dispatches the arm
-// CC and transport Start/Continue/Stop to the recorder.
+// Dispatch one complete channel-voice MIDI message: forward it to the plugin
+// host (so instruments play, routed by channel) and apply our arm/send CCs.
+static void dispatch_channel_message(uint8_t status, uint8_t d0, uint8_t d1, int ndata) {
+  uint8_t bytes[3] = {status, d0, d1};
+  juce_host_push_midi(bytes, 1 + ndata); // routed to instrument lanes by channel
+
+  if ((status & 0xF0) == 0xB0) { // Control Change
+    const int channel = (status & 0x0F) + 1, cc = d0, value = d1;
+    if (cc == recorder_arm_cc() &&
+        (recorder_arm_channel() == 0 || channel == recorder_arm_channel())) {
+      recorder_set_armed(value >= 64);
+    }
+    // Per-track send amounts: channel 1-8 = track, CC20/21/22 = send bus.
+    const int bus = cc - SEND_CC_BASE;
+    if (bus >= 0 && bus < JUCE_HOST_NUM_SENDS && channel >= 1 && channel <= JUCE_HOST_NUM_TRACKS) {
+      juce_host_set_send(channel - 1, bus, (float)value / 127.0f);
+    }
+  }
+}
+
+// Parse a run of raw MIDI bytes (running status aware) into complete messages.
 static void parse_midi_bytes(const uint8_t *data, int len) {
-  static uint8_t status = 0;
-  static uint8_t d1 = 0;
-  static int expect = 0; // remaining data bytes for current message
-  static int have = 0;   // data bytes collected so far
+  static uint8_t status = 0, d[2] = {0, 0};
+  static int expect = 0, have = 0;
 
   for (int i = 0; i < len; i++) {
     const uint8_t b = data[i];
     if (b & 0x80) {
-      // Real-time messages (0xF8-0xFF) may interleave without breaking running
-      // status. Transport: Start=0xFA, Continue=0xFB, Stop=0xFC.
+      // Real-time (0xF8-0xFF) may interleave without breaking running status.
       if (b >= 0xF8) {
-        if (b == 0xFA || b == 0xFB) {
-          SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION, "midi_cc: transport %s",
-                       b == 0xFA ? "START" : "CONTINUE");
-          recorder_set_playing(true);
-        } else if (b == 0xFC) {
-          SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION, "midi_cc: transport STOP");
-          recorder_set_playing(false);
-        }
+        if (b == 0xFA || b == 0xFB)
+          recorder_set_playing(true); // transport Start/Continue
+        else if (b == 0xFC)
+          recorder_set_playing(false); // transport Stop
         continue;
       }
-      status = b;
-      have = 0;
       const uint8_t hi = b & 0xF0;
-      expect = (hi == 0xC0 || hi == 0xD0) ? 1 : 2;
-      if (b >= 0xF0)
-        expect = 0; // system common: not tracked here
+      if (b >= 0xF0) { // system common: drop, reset running status
+        status = 0;
+        expect = have = 0;
+      } else {
+        status = b;
+        have = 0;
+        expect = (hi == 0xC0 || hi == 0xD0) ? 1 : 2;
+      }
       continue;
     }
     // Data byte.
-    if ((status & 0xF0) != 0xB0) {
-      if (expect > 0 && ++have >= expect)
-        have = 0;
+    if (status == 0 || expect == 0)
       continue;
-    }
-    if (have == 0) {
-      d1 = b;
-      have = 1;
-    } else {
-      const int channel = (status & 0x0F) + 1;
-      const int cc = d1, value = b;
-      if (cc == recorder_arm_cc() &&
-          (recorder_arm_channel() == 0 || channel == recorder_arm_channel())) {
-        recorder_set_armed(value >= 64);
-      }
-      // Per-track send amounts: channel 1-8 = track, CC20/21/22 = send bus.
-      const int bus = cc - SEND_CC_BASE;
-      if (bus >= 0 && bus < JUCE_HOST_NUM_SENDS && channel >= 1 && channel <= JUCE_HOST_NUM_TRACKS) {
-        juce_host_set_send(channel - 1, bus, (float)value / 127.0f);
-      }
-      have = 0; // running status: next pair is another CC
+    d[have++] = b;
+    if (have >= expect) {
+      have = 0;
+      dispatch_channel_message(status, d[0], expect == 2 ? d[1] : 0, expect);
     }
   }
 }
@@ -118,28 +118,34 @@ bool midi_cc_open(void) {
     return false;
   }
 
+  // Connect ALL MIDI sources: the M8 (arm/transport/sends + its musical MIDI)
+  // and any hardware keyboard, so instruments can be played from either.
   const ItemCount n = MIDIGetNumberOfSources();
+  int connected = 0;
   for (ItemCount i = 0; i < n; i++) {
     MIDIEndpointRef src = MIDIGetSource(i);
-    if (src != 0 && source_name_matches_m8(src)) {
-      g_source = src;
-      break;
+    if (src == 0)
+      continue;
+    char name[128] = {0};
+    CFStringRef cn = NULL;
+    if (MIDIObjectGetStringProperty(src, kMIDIPropertyDisplayName, &cn) == noErr && cn) {
+      CFStringGetCString(cn, name, sizeof(name), kCFStringEncodingUTF8);
+      CFRelease(cn);
+    }
+    if (MIDIPortConnectSource(g_port, src, NULL) == noErr) {
+      connected++;
+      SDL_Log("midi_cc: connected source '%s'%s", name,
+              source_name_matches_m8(src) ? " (M8)" : "");
     }
   }
-  if (g_source == 0) {
-    SDL_Log("midi_cc: no M8 MIDI source found (CC trigger disabled, keyboard still works)");
+  if (connected == 0) {
+    SDL_Log("midi_cc: no MIDI sources found");
     midi_cc_close();
     return false;
   }
 
-  err = MIDIPortConnectSource(g_port, g_source, NULL);
-  if (err != noErr) {
-    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "midi_cc: connect source failed (%d)", (int)err);
-    midi_cc_close();
-    return false;
-  }
-
-  SDL_Log("midi_cc: listening on the M8 MIDI port (arm CC %d + transport)", recorder_arm_cc());
+  SDL_Log("midi_cc: listening on %d source(s) (arm CC %d, transport, instruments)", connected,
+          recorder_arm_cc());
   return true;
 }
 

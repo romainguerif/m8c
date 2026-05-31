@@ -162,6 +162,12 @@ void plugin_rack_handle_event(struct app_context *ctx, const SDL_Event *e) {
     juce_host_bus_remove(g.sel_bus, g.sel_slot[g.sel_bus]);
     clamp_slot();
     break;
+  case SDL_SCANCODE_C: // cycle the lane's MIDI channel (0=off, 1..16)
+    if (g.sel_bus < JUCE_HOST_NUM_SENDS) {
+      int mc = (juce_host_bus_midi_channel(g.sel_bus) + 1) % 17;
+      juce_host_bus_set_midi_channel(g.sel_bus, mc);
+    }
+    break;
   case SDL_SCANCODE_S:
     juce_host_scan();
     break;
@@ -199,7 +205,15 @@ static void render_rack(SDL_Renderer *rend, int tw, int th) {
   for (int b = 0; b < JUCE_HOST_NUM_BUSES; b++) {
     int x = b * col_w + 2;
     int y = top;
-    inprint(rend, BUS_NAMES[b], x, y, b == g.sel_bus ? sel : hdr, 0);
+    char head[24];
+    if (b < JUCE_HOST_NUM_SENDS) {
+      int mc = juce_host_bus_midi_channel(b);
+      if (mc > 0) SDL_snprintf(head, sizeof(head), "%s c%d", BUS_NAMES[b], mc);
+      else SDL_snprintf(head, sizeof(head), "%s c-", BUS_NAMES[b]);
+    } else {
+      SDL_snprintf(head, sizeof(head), "%s", BUS_NAMES[b]);
+    }
+    inprint(rend, head, x, y, b == g.sel_bus ? sel : hdr, 0);
     y += LINE_H;
     int cap = juce_host_bus_capacity(b);
     int n = juce_host_bus_slot_count(b);
@@ -226,7 +240,7 @@ static void render_rack(SDL_Renderer *rend, int tw, int th) {
   // Footer hints.
   char foot[160];
   SDL_snprintf(foot, sizeof(foot),
-               "Arrows=nav  Shift+Up/Dn=move  A/Enter=add/edit  E=editor  B=bypass  X=del  S=scan  W=save");
+               "Arrows=nav  Shift+Up/Dn=move  A/Enter=add  E=edit  B=byp  X=del  C=midi-ch  S=scan  W=save");
   inprint(rend, foot, MARGIN, th - LINE_H, dim, 0);
   char lat[48];
   SDL_snprintf(lat, sizeof(lat), "PDC: %d smp", juce_host_latency_samples());

@@ -3,6 +3,7 @@
 // Released under the MIT licence, https://opensource.org/licenses/MIT
 #include "juce_host.h"
 
+#include <juce_audio_basics/juce_audio_basics.h>
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_events/juce_events.h>
@@ -76,6 +77,9 @@ struct Bus {
   int latency = 0;          // sum of non-bypassed slot latencies
   DelayLine align;          // applied to this bus' wet output (sends only)
   juce::AudioBuffer<float> buf; // stereo work buffer
+  int midi_channel = 0;     // 1-16 = play instruments on this channel; 0 = off
+  std::mutex midi_mutex;                       // guards midi_pending
+  std::vector<juce::MidiMessage> midi_pending; // MIDI thread -> audio thread
 };
 
 // ---- Host state ----
@@ -140,12 +144,10 @@ void prepare_plugin_locked(Slot &s) {
   // crashes some plugins (e.g. AUs reading a null input in renderGetInput).
 }
 
-void run_chain_locked(Bus &bus, juce::AudioBuffer<float> &buf) {
-  juce::MidiBuffer midi;
+void run_chain_locked(Bus &bus, juce::AudioBuffer<float> &buf, juce::MidiBuffer &midi) {
   const int n = buf.getNumSamples();
   for (auto &s : bus.slots) {
     if (s.bypassed || !s.plugin) continue;
-    midi.clear();
     if (s.proc_channels <= 2) {
       s.plugin->processBlock(buf, midi);
     } else {
@@ -183,8 +185,11 @@ extern "C" void juce_host_init(void) {
       }
     }
   }
-  for (int b = 0; b < JUCE_HOST_NUM_BUSES; b++)
+  for (int b = 0; b < JUCE_HOST_NUM_BUSES; b++) {
     g_buses[b].capacity = (b == JUCE_HOST_BUS_MASTER) ? kMasterCap : kSendCap;
+    // Default: send 1/2/3 play MIDI on channels 1/2/3; master off.
+    g_buses[b].midi_channel = (b < JUCE_HOST_NUM_SENDS) ? (b + 1) : 0;
+  }
   for (int t = 0; t < JUCE_HOST_NUM_TRACKS; t++)
     for (int b = 0; b < JUCE_HOST_NUM_SENDS; b++)
       g_send[t][b].store(0.0f);
@@ -220,6 +225,11 @@ extern "C" void juce_host_prepare(double sample_rate, int max_block_frames) {
   for (int b = 0; b < JUCE_HOST_NUM_BUSES; b++) {
     g_buses[b].buf.setSize(2, g_maxBlock);
     g_buses[b].align.prepare(2, kMaxDelay);
+    {
+      std::lock_guard<std::mutex> mlk(g_buses[b].midi_mutex);
+      g_buses[b].midi_pending.clear();
+      g_buses[b].midi_pending.reserve(256);
+    }
     for (auto &s : g_buses[b].slots) prepare_plugin_locked(s);
   }
   g_dry.setSize(2, g_maxBlock);
@@ -647,6 +657,33 @@ extern "C" float juce_host_get_send(int track, int bus) {
 extern "C" bool juce_host_is_active(void) { return g_prepared; }
 
 // ===========================================================================
+// MIDI routing (instruments)
+// ===========================================================================
+extern "C" int juce_host_bus_midi_channel(int bus) {
+  if (bus < 0 || bus >= JUCE_HOST_NUM_BUSES) return 0;
+  return g_buses[bus].midi_channel;
+}
+
+extern "C" void juce_host_bus_set_midi_channel(int bus, int channel) {
+  if (bus < 0 || bus >= JUCE_HOST_NUM_BUSES) return;
+  g_buses[bus].midi_channel = juce::jlimit(0, 16, channel);
+}
+
+extern "C" void juce_host_push_midi(const unsigned char *data, int len) {
+  if (!g_prepared || len <= 0)
+    return;
+  juce::MidiMessage msg((const void *)data, len, 0.0);
+  const int ch = msg.getChannel(); // 1-16, or 0 for non-channel messages
+  for (int b = 0; b < JUCE_HOST_NUM_SENDS; b++) {
+    if (g_buses[b].midi_channel != 0 && g_buses[b].midi_channel == ch) {
+      std::lock_guard<std::mutex> mlk(g_buses[b].midi_mutex);
+      if (g_buses[b].midi_pending.size() < 1024)
+        g_buses[b].midi_pending.push_back(msg);
+    }
+  }
+}
+
+// ===========================================================================
 // Realtime processing
 // ===========================================================================
 extern "C" bool juce_host_process(const float *in24, int channels, int frames, float *out) {
@@ -693,7 +730,14 @@ extern "C" bool juce_host_process(const float *in24, int channels, int frames, f
         r[i] += in24[i * channels + cr] * g;
       }
     }
-    run_chain_locked(bus, bus.buf);
+    juce::MidiBuffer midi;
+    { // drain queued MIDI for this lane (notes for instruments), at block start
+      std::lock_guard<std::mutex> mlk(bus.midi_mutex);
+      for (auto &m : bus.midi_pending)
+        midi.addEvent(m, 0);
+      bus.midi_pending.clear();
+    }
+    run_chain_locked(bus, bus.buf, midi);
     bus.align.setDelay(maxSend - bus.latency);
     bus.align.process(bus.buf);
   }
@@ -710,8 +754,9 @@ extern "C" bool juce_host_process(const float *in24, int channels, int frames, f
     g_masterIn.addFrom(1, 0, g_buses[b].buf, 1, 0, frames);
   }
 
-  // Master chain.
-  run_chain_locked(g_buses[JUCE_HOST_BUS_MASTER], g_masterIn);
+  // Master chain (no MIDI input).
+  juce::MidiBuffer masterMidi;
+  run_chain_locked(g_buses[JUCE_HOST_BUS_MASTER], g_masterIn, masterMidi);
 
   const float *ml = g_masterIn.getReadPointer(0);
   const float *mr = g_masterIn.getReadPointer(1);
@@ -731,6 +776,7 @@ extern "C" void juce_host_save(const char *path) {
   for (int b = 0; b < JUCE_HOST_NUM_BUSES; b++) {
     auto *busXml = root.createNewChildElement("BUS");
     busXml->setAttribute("id", b);
+    busXml->setAttribute("midi_channel", g_buses[b].midi_channel);
     for (auto &s : g_buses[b].slots) {
       auto *slotXml = busXml->createNewChildElement("SLOT");
       slotXml->setAttribute("bypassed", s.bypassed);
@@ -762,6 +808,8 @@ extern "C" void juce_host_load(const char *path) {
   for (auto *busXml : root->getChildWithTagNameIterator("BUS")) {
     int b = busXml->getIntAttribute("id", -1);
     if (b < 0 || b >= JUCE_HOST_NUM_BUSES) continue;
+    g_buses[b].midi_channel = juce::jlimit(0, 16, busXml->getIntAttribute("midi_channel",
+                                                                          g_buses[b].midi_channel));
     for (auto *slotXml : busXml->getChildWithTagNameIterator("SLOT")) {
       auto *descXml = slotXml->getChildByName("PLUGIN");
       juce::PluginDescription desc;
