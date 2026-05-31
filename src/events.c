@@ -1,6 +1,7 @@
 #include "events.h"
 #include "backends/m8.h"
 #include "backends/m8_audio_capture.h"
+#include "backends/recorder.h"
 #include "common.h"
 #include "gamepads.h"
 #include "input.h"
@@ -79,6 +80,18 @@ SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
     // Toggle the plugin rack overlay (F3), then route to it when open.
     if (event->key.scancode == SDL_SCANCODE_F3 && event->key.repeat == 0) {
       plugin_rack_toggle_open();
+      return ret_val;
+    }
+
+    // Toggle monitor output: SDL (default, safe) <-> duplex CoreAudio (lowest
+    // latency, one clock). Global; works with the overlay open.
+    if (event->key.scancode == SDL_SCANCODE_F7 && event->key.repeat == 0) {
+      const int mode = recorder_toggle_monitor_mode();
+      if (mode < 0)
+        renderer_set_title("m8c  monitor: duplex unavailable (input-only)");
+      else
+        renderer_set_title(mode ? "m8c  monitor: DUPLEX (low latency)"
+                                : "m8c  monitor: SDL");
       return ret_val;
     }
 

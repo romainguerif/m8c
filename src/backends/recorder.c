@@ -44,6 +44,7 @@ static recorder_config_s cfg;
 // only used for the stereo master monitor output (SDL caps at 8 channels).
 static SDL_AudioStream *monitor_stream = NULL; // master (ch 1-2) -> output
 static bool capture_ready = false;
+static int monitor_duplex = 0; // 0 = SDL output (default), 1 = duplex CoreAudio
 static int channels = 0;       // M8 capture channels (24)
 static int rec_channels = 0;   // channels + 2 (extra stereo = processed master)
 static int sample_rate = 44100;
@@ -153,9 +154,9 @@ static inline int16_t f32_to_s16(float v) {
 // Capture callback (CoreAudio IO thread): feed monitor + disk ring.
 // `src` is interleaved float32 [-1,1], `frames` frames of `ch` channels.
 // ---------------------------------------------------------------------------
-static void recorder_on_frames(const float *src, int frames, int ch) {
+static int recorder_on_frames(const float *src, int frames, int ch, float *out_monitor) {
   if (!capture_ready || frames <= 0)
-    return;
+    return 0;
   const int nf = frames > MON_MAX_FRAMES ? MON_MAX_FRAMES : frames;
 
   // Compute the processed (wet) master: 3 sends + master chain through the
@@ -173,8 +174,14 @@ static void recorder_on_frames(const float *src, int frames, int ch) {
       host_sends[i] = 0.0f;
   }
 
-  // Master monitor: send the wet master back to the M8.
-  if (monitor_stream != NULL) {
+  // Master monitor: the wet master, sent back to the M8.
+  // Always stage it into the duplex output scratch (cheap); the capture layer
+  // only uses it when duplex monitoring is the active mode.
+  if (out_monitor != NULL)
+    SDL_memcpy(out_monitor, host_out, (size_t)nf * 2 * sizeof(float));
+
+  // SDL monitor path (default). Skipped when duplex CoreAudio output is active.
+  if (monitor_stream != NULL && !monitor_duplex) {
     for (int i = 0; i < nf * 2; i++)
       monitor_tmp[i] = f32_to_s16(host_out[i]);
     SDL_PutAudioStreamData(monitor_stream, monitor_tmp, nf * 2 * (int)sizeof(int16_t));
@@ -202,6 +209,7 @@ static void recorder_on_frames(const float *src, int frames, int ch) {
     }
     SDL_UnlockMutex(rb_lock);
   }
+  return nf; // stereo frames staged in out_monitor
 }
 
 // ---------------------------------------------------------------------------
@@ -552,3 +560,24 @@ void recorder_toggle_manual(void) {
 int recorder_arm_cc(void) { return cfg.arm_cc; }
 int recorder_arm_channel(void) { return cfg.arm_channel; }
 unsigned int recorder_record_key_scancode(void) { return cfg.record_key; }
+
+int recorder_monitor_is_duplex(void) { return monitor_duplex; }
+
+// Toggle monitoring between SDL output (default) and the low-latency duplex
+// CoreAudio output. Returns the new mode (1 = duplex, 0 = SDL), or -1 if duplex
+// is unavailable. To avoid two engines driving the same device, the SDL stream
+// is paused while duplex is active and resumed when switching back.
+int recorder_toggle_monitor_mode(void) {
+  if (!m8_capture_has_output())
+    return -1; // device is input-only; stay on SDL
+  monitor_duplex = monitor_duplex ? 0 : 1;
+  m8_capture_set_monitor_duplex(monitor_duplex != 0);
+  if (monitor_stream != NULL) {
+    if (monitor_duplex)
+      SDL_PauseAudioStreamDevice(monitor_stream);
+    else
+      SDL_ResumeAudioStreamDevice(monitor_stream);
+  }
+  SDL_Log("recorder: monitor mode = %s", monitor_duplex ? "duplex (CoreAudio)" : "SDL");
+  return monitor_duplex;
+}

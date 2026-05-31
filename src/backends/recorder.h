@@ -31,4 +31,8 @@ int recorder_arm_cc(void);                        // CC number, 0-127
 int recorder_arm_channel(void);                   // 1-16, or 0 = any
 unsigned int recorder_record_key_scancode(void);  // SDL scancode test key
 
+// --- Monitor output mode ---
+int recorder_monitor_is_duplex(void);   // 1 = duplex CoreAudio, 0 = SDL
+int recorder_toggle_monitor_mode(void); // returns new mode, or -1 if unavailable
+
 #endif

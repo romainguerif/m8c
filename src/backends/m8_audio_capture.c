@@ -35,9 +35,17 @@ int m8_capture_set_block_frames(int frames) {
 
 static AudioObjectID g_dev = kAudioObjectUnknown;
 static AudioDeviceIOProcID g_proc = NULL;
-static AudioStreamBasicDescription g_asbd;
-static float *g_scratch = NULL;     // interleaved float32 output
+static AudioStreamBasicDescription g_asbd;     // input format
+static AudioStreamBasicDescription g_out_asbd; // output format (if duplex)
+static int g_out_channels = 0;                 // device output channels (0 = no output)
+static float *g_scratch = NULL;     // interleaved float32 input
 static int g_scratch_frames = 0;
+static float *g_mon = NULL;         // interleaved stereo monitor scratch (frames*2)
+static int g_mon_frames = 0;
+static int g_monitor_duplex = 0;    // 0 = monitor via SDL (default), 1 = via this IOProc
+
+bool m8_capture_has_output(void) { return g_out_channels >= 2; }
+void m8_capture_set_monitor_duplex(bool on) { g_monitor_duplex = (on && g_out_channels >= 2) ? 1 : 0; }
 
 // Set the IOProc buffer size (frames), clamped to the device's range. Safe to
 // call while the device is running (CoreAudio re-negotiates live). Returns the
@@ -75,6 +83,24 @@ int m8_capture_set_block_frames(int frames) {
 static int device_input_channels(AudioObjectID dev) {
   AudioObjectPropertyAddress addr = {kAudioDevicePropertyStreamConfiguration,
                                      kAudioObjectPropertyScopeInput,
+                                     kAudioObjectPropertyElementMain};
+  UInt32 size = 0;
+  if (AudioObjectGetPropertyDataSize(dev, &addr, 0, NULL, &size) != noErr || size == 0)
+    return 0;
+  AudioBufferList *bl = SDL_malloc(size);
+  int total = 0;
+  if (AudioObjectGetPropertyData(dev, &addr, 0, NULL, &size, bl) == noErr) {
+    for (UInt32 i = 0; i < bl->mNumberBuffers; i++)
+      total += bl->mBuffers[i].mNumberChannels;
+  }
+  SDL_free(bl);
+  return total;
+}
+
+// Sum of output channels for a device (0 = no output / input-only).
+static int device_output_channels(AudioObjectID dev) {
+  AudioObjectPropertyAddress addr = {kAudioDevicePropertyStreamConfiguration,
+                                     kAudioObjectPropertyScopeOutput,
                                      kAudioObjectPropertyElementMain};
   UInt32 size = 0;
   if (AudioObjectGetPropertyDataSize(dev, &addr, 0, NULL, &size) != noErr || size == 0)
@@ -131,10 +157,52 @@ static AudioObjectID find_m8_input_device(void) {
   return exact != kAudioObjectUnknown ? exact : substr;
 }
 
+// Write `mon` (interleaved stereo, `frames` frames) into the device output
+// buffer list, converting to the device format and zeroing any extra channels.
+static void write_output(AudioBufferList *output, const float *mon, int frames) {
+  const bool is_float = (g_out_asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0;
+  const int bps = (int)(g_out_asbd.mBitsPerChannel / 8);
+  const int oc = g_out_channels;
+  if ((int)output->mNumberBuffers == oc) {
+    // Non-interleaved: one buffer per channel.
+    for (int c = 0; c < oc; c++) {
+      void *dst = output->mBuffers[c].mData;
+      if (dst == NULL)
+        continue;
+      for (int fr = 0; fr < frames; fr++) {
+        const float s = (c < 2 && mon != NULL) ? mon[fr * 2 + c] : 0.0f;
+        if (is_float)
+          ((float *)dst)[fr] = s;
+        else if (bps == 2)
+          ((int16_t *)dst)[fr] = (int16_t)(s * 32767.0f);
+        else
+          ((int32_t *)dst)[fr] = (int32_t)(s * 2147483647.0f);
+      }
+    }
+  } else {
+    // Interleaved in buffer 0.
+    void *dst = output->mBuffers[0].mData;
+    if (dst == NULL)
+      return;
+    for (int fr = 0; fr < frames; fr++) {
+      for (int c = 0; c < oc; c++) {
+        const float s = (c < 2 && mon != NULL) ? mon[fr * 2 + c] : 0.0f;
+        const int i = fr * oc + c;
+        if (is_float)
+          ((float *)dst)[i] = s;
+        else if (bps == 2)
+          ((int16_t *)dst)[i] = (int16_t)(s * 32767.0f);
+        else
+          ((int32_t *)dst)[i] = (int32_t)(s * 2147483647.0f);
+      }
+    }
+  }
+}
+
 static OSStatus io_proc(AudioObjectID dev, const AudioTimeStamp *now,
                         const AudioBufferList *input, const AudioTimeStamp *intime,
                         AudioBufferList *output, const AudioTimeStamp *outtime, void *client) {
-  (void)dev; (void)now; (void)intime; (void)output; (void)outtime; (void)client;
+  (void)dev; (void)now; (void)intime; (void)outtime; (void)client;
   if (input == NULL || input->mNumberBuffers == 0 || g_cb == NULL)
     return noErr;
 
@@ -189,7 +257,20 @@ static OSStatus io_proc(AudioObjectID dev, const AudioTimeStamp *now,
     }
   }
 
-  g_cb(g_scratch, frames, ch);
+  // Hand a stereo monitor scratch to the callback (it fills the wet master).
+  if (frames > g_mon_frames) {
+    g_mon = SDL_realloc(g_mon, (size_t)frames * 2 * sizeof(float));
+    g_mon_frames = frames;
+  }
+  const int mon = g_cb(g_scratch, frames, ch, g_mon);
+
+  // Duplex monitoring: write straight to this device's output (same clock).
+  // In SDL mode (or no monitor), still fill the output with silence so the
+  // device doesn't emit garbage on the channels this IOProc owns.
+  if (output != NULL && output->mNumberBuffers > 0 && g_out_channels > 0) {
+    const bool duplex = (g_monitor_duplex != 0) && (mon > 0) && (g_mon != NULL);
+    write_output(output, duplex ? g_mon : NULL, frames);
+  }
   return noErr;
 }
 
@@ -216,6 +297,27 @@ bool m8_capture_start(m8_capture_cb cb) {
           (g_asbd.mFormatFlags & kAudioFormatFlagIsFloat) ? "float" : "int",
           (g_asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) ? " (non-interleaved)"
                                                                    : " (interleaved)");
+
+  // Detect a duplex output on the same device (for low-latency monitoring,
+  // optional — SDL monitoring stays the default). 0 = input-only.
+  g_out_channels = device_output_channels(g_dev);
+  if (g_out_channels > 0) {
+    AudioObjectPropertyAddress ofmt = {kAudioDevicePropertyStreamFormat,
+                                       kAudioObjectPropertyScopeOutput,
+                                       kAudioObjectPropertyElementMain};
+    UInt32 osize = sizeof(g_out_asbd);
+    if (AudioObjectGetPropertyData(g_dev, &ofmt, 0, NULL, &osize, &g_out_asbd) == noErr) {
+      SDL_Log("m8_capture: M8 output %d ch, %d-bit %s%s (duplex monitoring available)",
+              g_out_channels, (int)g_out_asbd.mBitsPerChannel,
+              (g_out_asbd.mFormatFlags & kAudioFormatFlagIsFloat) ? "float" : "int",
+              (g_out_asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) ? " (non-interleaved)"
+                                                                           : " (interleaved)");
+    } else {
+      g_out_channels = 0; // can't read format -> don't risk writing output
+    }
+  } else {
+    SDL_Log("m8_capture: M8 device is input-only (no duplex; SDL monitoring only)");
+  }
 
   // Pin the IOProc buffer size for stable, predictable processing deadlines.
   {
@@ -256,6 +358,13 @@ void m8_capture_stop(void) {
     g_scratch = NULL;
     g_scratch_frames = 0;
   }
+  if (g_mon != NULL) {
+    SDL_free(g_mon);
+    g_mon = NULL;
+    g_mon_frames = 0;
+  }
+  g_out_channels = 0;
+  g_monitor_duplex = 0;
   g_cb = NULL;
 }
 
@@ -269,4 +378,6 @@ bool m8_capture_start(m8_capture_cb cb) {
   return false;
 }
 void m8_capture_stop(void) {}
+bool m8_capture_has_output(void) { return false; }
+void m8_capture_set_monitor_duplex(bool on) { (void)on; }
 #endif
