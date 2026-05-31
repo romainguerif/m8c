@@ -69,6 +69,9 @@ struct Slot {
   bool bypassed = false;
   int latency = 0;
   int proc_channels = 2; // jmax(total in, out): buffer size processBlock needs
+  int quick_param[3] = {-1, -1, -1}; // assigned plugin parameter index, or -1
+  int quick_cc[3] = {-1, -1, -1};    // bound MIDI CC number, or -1
+  int quick_chan[3] = {-1, -1, -1};  // bound MIDI channel (1-16), or -1 = any
 };
 
 struct Bus {
@@ -98,6 +101,9 @@ namespace {
 std::mutex g_lock;        // guards buses + prepared state
 Bus g_buses[JUCE_HOST_NUM_BUSES];
 std::atomic<float> g_send[JUCE_HOST_NUM_TRACKS][JUCE_HOST_NUM_SENDS];
+
+// MIDI-learn target for quick params (set on main thread, read on MIDI thread).
+std::atomic<int> g_learn_bus{-1}, g_learn_slot{-1}, g_learn_quick{-1};
 
 bool g_prepared = false;
 double g_sr = 44100.0;
@@ -669,11 +675,24 @@ extern "C" void juce_host_bus_set_midi_channel(int bus, int channel) {
   g_buses[bus].midi_channel = juce::jlimit(0, 16, channel);
 }
 
+// Resolve a quick param's target AudioProcessorParameter (caller holds g_lock).
+static juce::AudioProcessorParameter *quick_target_locked(Slot &s, int quick) {
+  if (quick < 0 || quick >= JUCE_HOST_NUM_QUICK || !s.plugin)
+    return nullptr;
+  const int p = s.quick_param[quick];
+  const auto &params = s.plugin->getParameters();
+  if (p < 0 || p >= params.size())
+    return nullptr;
+  return params[p];
+}
+
 extern "C" void juce_host_push_midi(const unsigned char *data, int len) {
   if (!g_prepared || len <= 0)
     return;
   juce::MidiMessage msg((const void *)data, len, 0.0);
   const int ch = msg.getChannel(); // 1-16, or 0 for non-channel messages
+
+  // Route notes/CC to instrument lanes on the matching channel (lock-free).
   for (int b = 0; b < JUCE_HOST_NUM_SENDS; b++) {
     if (g_buses[b].midi_channel != 0 && g_buses[b].midi_channel == ch) {
       std::lock_guard<std::mutex> mlk(g_buses[b].midi_mutex);
@@ -681,7 +700,109 @@ extern "C" void juce_host_push_midi(const unsigned char *data, int len) {
         g_buses[b].midi_pending.push_back(msg);
     }
   }
+
+  // Quick-param control: bind on MIDI-learn, else drive bound params.
+  if (msg.isController()) {
+    const int cc = msg.getControllerNumber();
+    const float v = msg.getControllerValue() / 127.0f;
+    std::lock_guard<std::mutex> lk(g_lock);
+    const int lb = g_learn_bus.load(), ls = g_learn_slot.load(), lq = g_learn_quick.load();
+    if (lq >= 0 && lb >= 0 && lb < JUCE_HOST_NUM_BUSES && ls >= 0 &&
+        ls < (int)g_buses[lb].slots.size()) {
+      g_buses[lb].slots[ls].quick_cc[lq] = cc;
+      g_buses[lb].slots[ls].quick_chan[lq] = ch;
+      g_learn_quick.store(-1);
+      g_learn_bus.store(-1);
+      g_learn_slot.store(-1);
+    } else {
+      for (int b = 0; b < JUCE_HOST_NUM_BUSES; b++)
+        for (auto &s : g_buses[b].slots)
+          for (int q = 0; q < JUCE_HOST_NUM_QUICK; q++)
+            if (s.quick_cc[q] == cc && (s.quick_chan[q] < 0 || s.quick_chan[q] == ch))
+              if (auto *p = quick_target_locked(s, q))
+                p->setValueNotifyingHost(v);
+    }
+  }
 }
+
+extern "C" int juce_host_slot_param_count(int bus, int slot) {
+  if (bus < 0 || bus >= JUCE_HOST_NUM_BUSES) return 0;
+  std::lock_guard<std::mutex> lk(g_lock);
+  auto &v = g_buses[bus].slots;
+  if (slot < 0 || slot >= (int)v.size() || !v[slot].plugin) return 0;
+  return v[slot].plugin->getParameters().size();
+}
+
+extern "C" void juce_host_slot_param_name(int bus, int slot, int param, char *out, int out_size) {
+  out[0] = '\0';
+  if (bus < 0 || bus >= JUCE_HOST_NUM_BUSES) return;
+  std::lock_guard<std::mutex> lk(g_lock);
+  auto &v = g_buses[bus].slots;
+  if (slot < 0 || slot >= (int)v.size() || !v[slot].plugin) return;
+  const auto &params = v[slot].plugin->getParameters();
+  if (param < 0 || param >= params.size()) return;
+  params[param]->getName(out_size - 1).copyToUTF8(out, (size_t)out_size);
+}
+
+extern "C" int juce_host_slot_quick_param(int bus, int slot, int quick) {
+  if (bus < 0 || bus >= JUCE_HOST_NUM_BUSES || quick < 0 || quick >= JUCE_HOST_NUM_QUICK) return -1;
+  std::lock_guard<std::mutex> lk(g_lock);
+  auto &v = g_buses[bus].slots;
+  if (slot < 0 || slot >= (int)v.size()) return -1;
+  return v[slot].quick_param[quick];
+}
+
+extern "C" void juce_host_slot_quick_assign(int bus, int slot, int quick, int param) {
+  if (bus < 0 || bus >= JUCE_HOST_NUM_BUSES || quick < 0 || quick >= JUCE_HOST_NUM_QUICK) return;
+  std::lock_guard<std::mutex> lk(g_lock);
+  auto &v = g_buses[bus].slots;
+  if (slot < 0 || slot >= (int)v.size()) return;
+  v[slot].quick_param[quick] = param;
+}
+
+extern "C" void juce_host_slot_quick_label(int bus, int slot, int quick, char *out, int out_size) {
+  std::snprintf(out, (size_t)out_size, "--");
+  if (bus < 0 || bus >= JUCE_HOST_NUM_BUSES) return;
+  std::lock_guard<std::mutex> lk(g_lock);
+  auto &v = g_buses[bus].slots;
+  if (slot < 0 || slot >= (int)v.size()) return;
+  if (auto *p = quick_target_locked(v[slot], quick))
+    p->getName(out_size - 1).copyToUTF8(out, (size_t)out_size);
+}
+
+extern "C" float juce_host_slot_quick_value(int bus, int slot, int quick) {
+  if (bus < 0 || bus >= JUCE_HOST_NUM_BUSES) return 0;
+  std::lock_guard<std::mutex> lk(g_lock);
+  auto &v = g_buses[bus].slots;
+  if (slot < 0 || slot >= (int)v.size()) return 0;
+  if (auto *p = quick_target_locked(v[slot], quick)) return p->getValue();
+  return 0;
+}
+
+extern "C" void juce_host_slot_quick_nudge(int bus, int slot, int quick, float delta) {
+  if (bus < 0 || bus >= JUCE_HOST_NUM_BUSES) return;
+  std::lock_guard<std::mutex> lk(g_lock);
+  auto &v = g_buses[bus].slots;
+  if (slot < 0 || slot >= (int)v.size()) return;
+  if (auto *p = quick_target_locked(v[slot], quick))
+    p->setValueNotifyingHost(juce::jlimit(0.0f, 1.0f, p->getValue() + delta));
+}
+
+extern "C" int juce_host_slot_quick_cc(int bus, int slot, int quick) {
+  if (bus < 0 || bus >= JUCE_HOST_NUM_BUSES || quick < 0 || quick >= JUCE_HOST_NUM_QUICK) return -1;
+  std::lock_guard<std::mutex> lk(g_lock);
+  auto &v = g_buses[bus].slots;
+  if (slot < 0 || slot >= (int)v.size()) return -1;
+  return v[slot].quick_cc[quick];
+}
+
+extern "C" void juce_host_begin_learn(int bus, int slot, int quick) {
+  g_learn_bus.store(bus);
+  g_learn_slot.store(slot);
+  g_learn_quick.store(quick);
+}
+
+extern "C" bool juce_host_is_learning(void) { return g_learn_quick.load() >= 0; }
 
 // ===========================================================================
 // Realtime processing
@@ -780,6 +901,11 @@ extern "C" void juce_host_save(const char *path) {
     for (auto &s : g_buses[b].slots) {
       auto *slotXml = busXml->createNewChildElement("SLOT");
       slotXml->setAttribute("bypassed", s.bypassed);
+      for (int q = 0; q < JUCE_HOST_NUM_QUICK; q++) {
+        slotXml->setAttribute("q" + juce::String(q) + "p", s.quick_param[q]);
+        slotXml->setAttribute("q" + juce::String(q) + "cc", s.quick_cc[q]);
+        slotXml->setAttribute("q" + juce::String(q) + "ch", s.quick_chan[q]);
+      }
       if (auto descXml = s.desc.createXml())
         slotXml->addChildElement(descXml.release());
       if (s.plugin) {
@@ -826,6 +952,11 @@ extern "C" void juce_host_load(const char *path) {
         juce::MemoryBlock mb;
         mb.fromBase64Encoding(state);
         s.plugin->setStateInformation(mb.getData(), (int)mb.getSize());
+      }
+      for (int q = 0; q < JUCE_HOST_NUM_QUICK; q++) {
+        s.quick_param[q] = slotXml->getIntAttribute("q" + juce::String(q) + "p", -1);
+        s.quick_cc[q] = slotXml->getIntAttribute("q" + juce::String(q) + "cc", -1);
+        s.quick_chan[q] = slotXml->getIntAttribute("q" + juce::String(q) + "ch", -1);
       }
       if (g_prepared) prepare_plugin_locked(s);
       if ((int)g_buses[b].slots.size() < g_buses[b].capacity)

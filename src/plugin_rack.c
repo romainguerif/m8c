@@ -11,7 +11,7 @@
 #define LINE_H 10
 #define MARGIN 4
 
-enum { MODE_RACK, MODE_BROWSER };
+enum { MODE_RACK, MODE_BROWSER, MODE_PARAMS, MODE_PARAMPICK };
 
 static const char *BUS_NAMES[JUCE_HOST_NUM_BUSES] = {"SEND 1", "SEND 2", "SEND 3", "MASTER"};
 
@@ -23,6 +23,9 @@ static struct {
   int target_bus;                    // bus the browser loads into
   int browser_sel;
   int browser_scroll;
+  int params_bus, params_slot;       // slot being edited in MODE_PARAMS
+  int params_sel;                    // selected quick (0..2)
+  int pick_sel, pick_scroll;         // parameter picker selection
   bool loaded_once; // auto-load persisted state on first open
   int needs_redraw;
   SDL_Texture *texture;
@@ -98,6 +101,64 @@ void plugin_rack_handle_event(struct app_context *ctx, const SDL_Event *e) {
     return;
   }
 
+  if (g.mode == MODE_PARAMS) {
+    switch (sc) {
+    case SDL_SCANCODE_UP:
+      if (g.params_sel > 0) g.params_sel--;
+      break;
+    case SDL_SCANCODE_DOWN:
+      if (g.params_sel < JUCE_HOST_NUM_QUICK - 1) g.params_sel++;
+      break;
+    case SDL_SCANCODE_LEFT:
+      juce_host_slot_quick_nudge(g.params_bus, g.params_slot, g.params_sel, -0.05f);
+      break;
+    case SDL_SCANCODE_RIGHT:
+      juce_host_slot_quick_nudge(g.params_bus, g.params_slot, g.params_sel, +0.05f);
+      break;
+    case SDL_SCANCODE_RETURN: // assign a plugin parameter from the list
+      g.pick_sel = 0;
+      g.pick_scroll = 0;
+      g.mode = MODE_PARAMPICK;
+      break;
+    case SDL_SCANCODE_L: // MIDI-learn: bind the next incoming CC
+      juce_host_begin_learn(g.params_bus, g.params_slot, g.params_sel);
+      break;
+    case SDL_SCANCODE_X:
+    case SDL_SCANCODE_DELETE:
+    case SDL_SCANCODE_BACKSPACE:
+      juce_host_slot_quick_assign(g.params_bus, g.params_slot, g.params_sel, -1);
+      break;
+    case SDL_SCANCODE_ESCAPE:
+      g.mode = MODE_RACK;
+      break;
+    default:
+      break;
+    }
+    return;
+  }
+
+  if (g.mode == MODE_PARAMPICK) {
+    const int pc = juce_host_slot_param_count(g.params_bus, g.params_slot);
+    switch (sc) {
+    case SDL_SCANCODE_UP:
+      if (g.pick_sel > 0) g.pick_sel--;
+      break;
+    case SDL_SCANCODE_DOWN:
+      if (g.pick_sel < pc - 1) g.pick_sel++;
+      break;
+    case SDL_SCANCODE_RETURN:
+      juce_host_slot_quick_assign(g.params_bus, g.params_slot, g.params_sel, g.pick_sel);
+      g.mode = MODE_PARAMS;
+      break;
+    case SDL_SCANCODE_ESCAPE:
+      g.mode = MODE_PARAMS;
+      break;
+    default:
+      break;
+    }
+    return;
+  }
+
   // RACK mode.
   switch (sc) {
   case SDL_SCANCODE_ESCAPE:
@@ -150,6 +211,14 @@ void plugin_rack_handle_event(struct app_context *ctx, const SDL_Event *e) {
   }
   case SDL_SCANCODE_E:
     juce_host_slot_open_editor(g.sel_bus, g.sel_slot[g.sel_bus]);
+    break;
+  case SDL_SCANCODE_P: // quick-params editor for the selected slot
+    if (g.sel_slot[g.sel_bus] < juce_host_bus_slot_count(g.sel_bus)) {
+      g.params_bus = g.sel_bus;
+      g.params_slot = g.sel_slot[g.sel_bus];
+      g.params_sel = 0;
+      g.mode = MODE_PARAMS;
+    }
     break;
   case SDL_SCANCODE_B: {
     int s = g.sel_slot[g.sel_bus];
@@ -240,7 +309,7 @@ static void render_rack(SDL_Renderer *rend, int tw, int th) {
   // Footer hints.
   char foot[160];
   SDL_snprintf(foot, sizeof(foot),
-               "Arrows=nav  Shift+Up/Dn=move  A/Enter=add  E=edit  B=byp  X=del  C=midi-ch  S=scan  W=save");
+               "Arrows=nav  Shift+UpDn=move  A=add  E=edit  P=params  B=byp  X=del  C=midi  S=scan  W=save");
   inprint(rend, foot, MARGIN, th - LINE_H, dim, 0);
   char lat[48];
   SDL_snprintf(lat, sizeof(lat), "PDC: %d smp", juce_host_latency_samples());
@@ -286,6 +355,67 @@ static void render_browser(SDL_Renderer *rend, int tw, int th) {
   inprint(rend, "Up/Down  Enter=load  Esc=back  S=rescan", MARGIN, th - LINE_H, dim, 0);
 }
 
+static void render_params(SDL_Renderer *rend, int tw, int th) {
+  const Uint32 fg = 0xFFFFFF, sel = 0x00FFFF, title = 0xFF0000, dim = 0x888888;
+  char slotname[64], head[96];
+  juce_host_slot_label(g.params_bus, g.params_slot, slotname, sizeof(slotname));
+  SDL_snprintf(head, sizeof(head), "QUICK PARAMS - %s", slotname);
+  inprint(rend, head, MARGIN, MARGIN, title, title);
+
+  const int top = MARGIN + LINE_H + 4;
+  for (int q = 0; q < JUCE_HOST_NUM_QUICK; q++) {
+    char pname[48];
+    juce_host_slot_quick_label(g.params_bus, g.params_slot, q, pname, sizeof(pname));
+    const float v = juce_host_slot_quick_value(g.params_bus, g.params_slot, q);
+    const int cc = juce_host_slot_quick_cc(g.params_bus, g.params_slot, q);
+    char ccbuf[12];
+    if (cc >= 0) SDL_snprintf(ccbuf, sizeof(ccbuf), "CC%d", cc);
+    else SDL_snprintf(ccbuf, sizeof(ccbuf), "CC--");
+    char line[160];
+    SDL_snprintf(line, sizeof(line), "Q%d  %-20s %3d%%  %s", q + 1, pname,
+                 (int)(v * 100.0f + 0.5f), ccbuf);
+    const int y = top + q * LINE_H;
+    if (q == g.params_sel) hl_bar(rend, 0, y, tw);
+    inprint(rend, line, MARGIN, y, q == g.params_sel ? 0x000000 : fg, 0);
+  }
+
+  if (juce_host_is_learning())
+    inprint(rend, "move a MIDI CC to bind it...", MARGIN, top + JUCE_HOST_NUM_QUICK * LINE_H + 4,
+            sel, 0);
+
+  inprint(rend, "Up/Dn=sel  L/R=value  Enter=assign  L=learn  X=clear  Esc=back", MARGIN,
+          th - LINE_H, dim, 0);
+}
+
+static void render_parampick(SDL_Renderer *rend, int tw, int th) {
+  const Uint32 fg = 0xFFFFFF, title = 0xFF0000, dim = 0x888888;
+  const int gx = (int)fonts_get(0)->glyph_x;
+  const int pc = juce_host_slot_param_count(g.params_bus, g.params_slot);
+
+  char head[64];
+  SDL_snprintf(head, sizeof(head), "ASSIGN PARAM TO Q%d  (%d params)", g.params_sel + 1, pc);
+  inprint(rend, head, MARGIN, MARGIN, title, title);
+
+  const int top = MARGIN + LINE_H + 2;
+  const int rows = (th - top - LINE_H) / LINE_H;
+  if (g.pick_sel < g.pick_scroll) g.pick_scroll = g.pick_sel;
+  if (g.pick_sel >= g.pick_scroll + rows) g.pick_scroll = g.pick_sel - rows + 1;
+
+  const int maxchars = (tw - 2 * MARGIN) / (gx > 0 ? gx : 6);
+  for (int i = 0; i < rows; i++) {
+    int idx = g.pick_scroll + i;
+    if (idx >= pc) break;
+    char raw[96], line[96];
+    juce_host_slot_param_name(g.params_bus, g.params_slot, idx, raw, sizeof(raw));
+    trunc_copy(line, raw, maxchars);
+    const int y = top + i * LINE_H;
+    const bool selrow = (idx == g.pick_sel);
+    if (selrow) hl_bar(rend, 0, y, tw);
+    inprint(rend, line, MARGIN, y, selrow ? 0x000000 : fg, 0);
+  }
+  inprint(rend, "Up/Down  Enter=assign  Esc=back", MARGIN, th - LINE_H, dim, 0);
+}
+
 void plugin_rack_render_overlay(SDL_Renderer *rend, int texture_w, int texture_h) {
   if (!g.is_open)
     return;
@@ -318,6 +448,10 @@ void plugin_rack_render_overlay(SDL_Renderer *rend, int texture_w, int texture_h
 
   if (g.mode == MODE_BROWSER)
     render_browser(rend, texture_w, texture_h);
+  else if (g.mode == MODE_PARAMS)
+    render_params(rend, texture_w, texture_h);
+  else if (g.mode == MODE_PARAMPICK)
+    render_parampick(rend, texture_w, texture_h);
   else
     render_rack(rend, texture_w, texture_h);
 

@@ -61,6 +61,21 @@ void juce_host_bus_set_midi_channel(int bus, int channel);
 // matching lanes. Called from the MIDI thread.
 void juce_host_push_midi(const unsigned char *data, int len);
 
+// --- Per-slot quick params: 3 plugin parameters exposed as macros, each
+//     assignable from the parameter list or via MIDI-learn (bind a CC). ---
+#define JUCE_HOST_NUM_QUICK 3
+int  juce_host_slot_param_count(int bus, int slot);
+void juce_host_slot_param_name(int bus, int slot, int param, char *out, int out_size);
+// quick index 0..2:
+int  juce_host_slot_quick_param(int bus, int slot, int quick);      // param idx or -1
+void juce_host_slot_quick_assign(int bus, int slot, int quick, int param);
+void juce_host_slot_quick_label(int bus, int slot, int quick, char *out, int out_size);
+float juce_host_slot_quick_value(int bus, int slot, int quick);     // 0..1
+void juce_host_slot_quick_nudge(int bus, int slot, int quick, float delta);
+int  juce_host_slot_quick_cc(int bus, int slot, int quick);         // bound CC or -1
+void juce_host_begin_learn(int bus, int slot, int quick);           // arm MIDI-learn
+bool juce_host_is_learning(void);
+
 // Total compensated output latency (samples), for info/UI.
 int  juce_host_latency_samples(void);
 
