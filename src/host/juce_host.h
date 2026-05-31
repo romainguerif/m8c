@@ -21,6 +21,11 @@ extern "C" {
 #define JUCE_HOST_NUM_BUSES 4
 #define JUCE_HOST_NUM_TRACKS 8
 
+// If this process was relaunched as the isolated plugin-scanner worker,
+// runs the worker loop and never returns (exits the process). Otherwise
+// returns false immediately. Call FIRST in SDL_AppInit, before any UI/audio.
+bool juce_host_run_scanner_if_worker(int argc, char **argv);
+
 // --- Lifecycle (main thread) ---
 void juce_host_init(void);
 void juce_host_pump(void);

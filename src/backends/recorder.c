@@ -3,7 +3,6 @@
 #include "recorder.h"
 
 #include "../ini.h"
-#include "../render.h"
 #include "juce_host.h"
 #include "m8_audio_capture.h"
 #include "ringbuffer.h"
@@ -290,7 +289,8 @@ static bool rec_begin(void) {
   SDL_SetAtomicInt(&recording, 1);
   disk_thread = SDL_CreateThread(disk_thread_fn, "m8c_recorder_disk", NULL);
 
-  renderer_set_title("m8c  \xE2\x97\x8F REC");
+  // NOTE: do not touch the SDL window here — rec_begin runs on the realtime /
+  // MIDI thread. The REC window-title indicator is updated from the main loop.
   SDL_Log("recorder: REC started -> %s (%d ch, %d Hz, %d-bit, %d files)", session_dir, channels,
           sample_rate, REC_BITS, num_files);
   return true;
@@ -341,7 +341,6 @@ static void rec_end(void) {
     SDL_free(disk_chunk);
     disk_chunk = NULL;
   }
-  renderer_set_title("m8c");
   SDL_Log("recorder: REC stopped -> %s (%d tracks kept, %d silent dropped)", session_dir, kept,
           dropped);
 }

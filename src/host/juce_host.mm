@@ -9,10 +9,16 @@
 #include <juce_gui_basics/juce_gui_basics.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <vector>
+
+// Command-line token used when m8c relaunches itself as an out-of-process
+// plugin-scanner worker (so a crashing plugin only kills the worker).
+#define M8C_SCANNER_TOKEN "m8c-plugin-scan-worker"
 
 namespace {
 
@@ -75,7 +81,14 @@ struct Bus {
 std::unique_ptr<juce::ScopedJuceInitialiser_GUI> g_juce;
 juce::AudioPluginFormatManager g_formats;
 juce::KnownPluginList g_known;
+std::mutex g_known_lock; // guards g_known (UI reads, scan driver writes)
 std::atomic<bool> g_scanning{false};
+
+} // namespace (helpers continue below)
+
+static void add_formats(juce::AudioPluginFormatManager &fm); // defined in Scanning section
+
+namespace {
 
 std::mutex g_lock;        // guards buses + prepared state
 Bus g_buses[JUCE_HOST_NUM_BUSES];
@@ -110,15 +123,13 @@ void recompute_latency_locked() {
 
 void prepare_plugin_locked(Slot &s) {
   if (!s.plugin) return;
-  s.plugin->enableAllBuses();
+  // Force a plain stereo in/out layout (do NOT enableAllBuses: that can turn on
+  // sidechain/aux input buses the host won't feed, which crashes some AUs).
   s.plugin->setPlayConfigDetails(2, 2, g_sr, g_maxBlock);
   s.plugin->prepareToPlay(g_sr, g_maxBlock);
   s.latency = s.plugin->getLatencySamples();
-  // Warm up off the audio thread (first call may allocate).
-  juce::AudioBuffer<float> tmp(2, g_maxBlock);
-  juce::MidiBuffer midi;
-  tmp.clear();
-  s.plugin->processBlock(tmp, midi);
+  // No warm-up processBlock: rendering before the host feeds proper buffers
+  // crashes some plugins (e.g. AUs reading a null input in renderGetInput).
 }
 
 void run_chain_locked(Bus &bus, juce::AudioBuffer<float> &buf) {
@@ -138,14 +149,20 @@ void run_chain_locked(Bus &bus, juce::AudioBuffer<float> &buf) {
 extern "C" void juce_host_init(void) {
   if (g_juce) return;
   g_juce = std::make_unique<juce::ScopedJuceInitialiser_GUI>();
-  // Add formats explicitly (the headless AudioPluginFormatManager deletes
-  // addDefaultFormats()).
-#if JUCE_PLUGINHOST_VST3
-  g_formats.addFormat(new juce::VST3PluginFormat());
-#endif
-#if JUCE_PLUGINHOST_AU && JUCE_MAC
-  g_formats.addFormat(new juce::AudioUnitPluginFormat());
-#endif
+  add_formats(g_formats);
+
+  // Reload the cached plugin list so we don't have to rescan every launch.
+  {
+    juce::File kf = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
+                        .getChildFile("m8c/known_plugins.xml");
+    if (kf.existsAsFile()) {
+      if (auto xml = juce::parseXML(kf)) {
+        const std::lock_guard<std::mutex> lk(g_known_lock);
+        g_known.recreateFromXml(*xml);
+        std::fprintf(stderr, "[juce_host] loaded %d cached plugins\n", g_known.getNumTypes());
+      }
+    }
+  }
   for (int b = 0; b < JUCE_HOST_NUM_BUSES; b++)
     g_buses[b].capacity = (b == JUCE_HOST_BUS_MASTER) ? kMasterCap : kSendCap;
   for (int t = 0; t < JUCE_HOST_NUM_TRACKS; t++)
@@ -153,6 +170,10 @@ extern "C" void juce_host_init(void) {
       g_send[t][b].store(0.0f);
   std::fprintf(stderr, "[juce_host] init — JUCE %d.%d.%d, %d formats\n", JUCE_MAJOR_VERSION,
                JUCE_MINOR_VERSION, JUCE_BUILDNUMBER, g_formats.getNumFormats());
+
+  // Dev convenience: auto-start a scan at launch for testing without the UI.
+  if (std::getenv("M8C_AUTOSCAN") != nullptr)
+    juce_host_scan();
 }
 
 extern "C" void juce_host_pump(void) {}
@@ -190,30 +211,275 @@ extern "C" void juce_host_prepare(double sample_rate, int max_block_frames) {
 }
 
 // ===========================================================================
-// Scanning
+// Scanning — OUT OF PROCESS (like Element): m8c relaunches itself as an
+// isolated scanner worker, so a plugin that crashes on instantiation only
+// kills the worker, not the host.
 // ===========================================================================
-extern "C" void juce_host_scan(void) {
-  g_scanning.store(true);
-  std::fprintf(stderr, "[juce_host] scanning plugins...\n");
-  juce::File dead = juce::File::getSpecialLocation(juce::File::tempDirectory)
-                        .getChildFile("m8c_plugin_scan.tmp");
-  for (int i = 0; i < g_formats.getNumFormats(); i++) {
-    juce::AudioPluginFormat *fmt = g_formats.getFormat(i);
-    juce::PluginDirectoryScanner scanner(g_known, *fmt, fmt->getDefaultLocationsToSearch(),
-                                         true, dead, false);
-    juce::String name;
-    while (scanner.scanNextFile(true, name)) { /* progress: name */ }
+static void add_formats(juce::AudioPluginFormatManager &fm) {
+#if JUCE_PLUGINHOST_VST3
+  fm.addFormat(new juce::VST3PluginFormat());
+#endif
+#if JUCE_PLUGINHOST_AU && JUCE_MAC
+  fm.addFormat(new juce::AudioUnitPluginFormat());
+#endif
+}
+
+namespace {
+
+static void wlog(const char *msg) {
+  FILE *f = std::fopen("/tmp/m8c_worker.log", "a");
+  if (f) { std::fprintf(f, "%s\n", msg); std::fclose(f); }
+}
+
+// Set false by the worker when the coordinator disconnects, to end its loop.
+std::atomic<bool> g_worker_alive{true};
+
+// ---- Worker side (child process): scans one plugin file at a time ----
+class ScanWorker : public juce::ChildProcessWorker, private juce::AsyncUpdater {
+public:
+  ScanWorker() {
+    // A plugin crash should just terminate the worker quietly.
+    juce::SystemStats::setApplicationCrashHandler([](void *) { std::_Exit(1); });
+    add_formats(formats);
+    wlog("[worker] constructed");
   }
-  g_scanning.store(false);
-  std::fprintf(stderr, "[juce_host] scan done: %d plugins known\n", g_known.getNumTypes());
+
+  void handleConnectionMade() override { wlog("[worker] connection made"); }
+
+  void handleMessageFromCoordinator(const juce::MemoryBlock &mb) override {
+    if (mb.isEmpty())
+      return;
+    const std::lock_guard<std::mutex> lock(mutex);
+    pending.add(mb);
+    triggerAsyncUpdate(); // do the (un-blockable) scan on the message thread
+  }
+
+  void handleAsyncUpdate() override {
+    for (;;) {
+      juce::MemoryBlock mb;
+      {
+        const std::lock_guard<std::mutex> lock(mutex);
+        if (pending.isEmpty())
+          return;
+        mb = pending.getReference(0);
+        pending.remove(0);
+      }
+      sendResults(doScan(mb));
+    }
+  }
+
+  void handleConnectionLost() override {
+    wlog("[worker] connection lost, ending");
+    g_worker_alive.store(false);
+  }
+
+private:
+  juce::OwnedArray<juce::PluginDescription> doScan(const juce::MemoryBlock &block) {
+    juce::MemoryInputStream in(block, false);
+    const juce::String formatName = in.readString();
+    const juce::String identifier = in.readString();
+    juce::OwnedArray<juce::PluginDescription> results;
+    {
+      char m[1100];
+      std::snprintf(m, sizeof(m), "[worker] doScan fmt=%s id=%s", formatName.toRawUTF8(),
+                    identifier.toRawUTF8());
+      wlog(m);
+    }
+    for (int i = 0; i < formats.getNumFormats(); i++) {
+      auto *f = formats.getFormat(i);
+      if (f->getName() == formatName) {
+        f->findAllTypesForFile(results, identifier);
+        break;
+      }
+    }
+    {
+      char m[128];
+      std::snprintf(m, sizeof(m), "[worker] doScan -> %d descriptions", results.size());
+      wlog(m);
+    }
+    return results;
+  }
+
+  void sendResults(const juce::OwnedArray<juce::PluginDescription> &results) {
+    juce::XmlElement xml("LIST");
+    for (auto *d : results)
+      xml.addChildElement(d->createXml().release());
+    const auto s = xml.toString();
+    sendMessageToCoordinator({s.toRawUTF8(), s.getNumBytesAsUTF8()});
+  }
+
+  juce::AudioPluginFormatManager formats;
+  std::mutex mutex;
+  juce::Array<juce::MemoryBlock> pending;
+};
+
+// ---- Coordinator side (host process): drives the worker ----
+class ScanCoordinator : public juce::ChildProcessCoordinator {
+public:
+  enum class State { timeout, gotResult, connectionLost };
+  struct Response { State state; std::unique_ptr<juce::XmlElement> xml; };
+
+  bool launch() {
+    auto exe = juce::File::getSpecialLocation(juce::File::currentExecutableFile);
+    return launchWorkerProcess(exe, M8C_SCANNER_TOKEN, 0, 0);
+  }
+
+  Response getResponse() {
+    std::unique_lock<std::mutex> lock(mutex);
+    if (!condvar.wait_for(lock, std::chrono::milliseconds(50),
+                          [&] { return gotResult || connectionLost; }))
+      return {State::timeout, nullptr};
+    const auto st = connectionLost ? State::connectionLost : State::gotResult;
+    connectionLost = gotResult = false;
+    return {st, std::move(result)};
+  }
+
+  void handleMessageFromWorker(const juce::MemoryBlock &mb) override {
+    const std::lock_guard<std::mutex> lock(mutex);
+    result = juce::parseXML(mb.toString());
+    gotResult = true;
+    condvar.notify_one();
+  }
+  void handleConnectionLost() override {
+    const std::lock_guard<std::mutex> lock(mutex);
+    connectionLost = true;
+    condvar.notify_one();
+  }
+
+private:
+  std::mutex mutex;
+  std::condition_variable condvar;
+  std::unique_ptr<juce::XmlElement> result;
+  bool gotResult = false, connectionLost = false;
+};
+
+// ---- Driver thread: enumerate files, feed worker, collect descriptions ----
+class ScanDriver : public juce::Thread {
+public:
+  ScanDriver() : juce::Thread("m8c_plugin_scan") {}
+
+  void run() override {
+    std::unique_ptr<ScanCoordinator> coord = std::make_unique<ScanCoordinator>();
+    if (!coord->launch()) {
+      std::fprintf(stderr, "[juce_host] could not launch scanner worker\n");
+      g_scanning.store(false);
+      return;
+    }
+
+    for (int fi = 0; fi < g_formats.getNumFormats() && !threadShouldExit(); fi++) {
+      auto *fmt = g_formats.getFormat(fi);
+      const juce::String formatName = fmt->getName();
+      auto ids = fmt->searchPathsForPlugins(fmt->getDefaultLocationsToSearch(), true, false);
+      std::fprintf(stderr, "[juce_host] format '%s': %d files to scan\n", formatName.toRawUTF8(),
+                   ids.size());
+      for (const auto &id : ids) {
+        if (threadShouldExit())
+          break;
+
+        juce::MemoryBlock req;
+        {
+          juce::MemoryOutputStream os(req, false);
+          os.writeString(formatName);
+          os.writeString(id);
+        }
+        const bool sent = coord->sendMessageToWorker(req);
+        if (!sent)
+          std::fprintf(stderr, "[juce_host] sendMessageToWorker FAILED for %s\n", id.toRawUTF8());
+
+        bool handled = false;
+        int waited = 0;
+        while (!handled && !threadShouldExit()) {
+          auto r = coord->getResponse();
+          if (r.state == ScanCoordinator::State::gotResult) {
+            int added = 0;
+            if (r.xml) {
+              const std::lock_guard<std::mutex> lock(g_known_lock);
+              for (auto *child : r.xml->getChildIterator()) {
+                juce::PluginDescription d;
+                if (d.loadFromXml(*child)) {
+                  g_known.addType(d);
+                  added++;
+                }
+              }
+            }
+            std::fprintf(stderr, "[juce_host] scanned %s (+%d) [%d known]\n", id.toRawUTF8(),
+                         added, (int)g_known.getNumTypes());
+            handled = true;
+          } else if (r.state == ScanCoordinator::State::connectionLost ||
+                     (++waited > 120 /* ~6s */)) {
+            // Worker crashed or hung on this plugin: relaunch and skip it.
+            std::fprintf(stderr, "[juce_host] scanner lost on %s (skipped)\n", id.toRawUTF8());
+            coord = std::make_unique<ScanCoordinator>();
+            coord->launch();
+            handled = true; // skip this id
+          }
+        }
+      }
+    }
+    // Persist the discovered plugin list for next launch.
+    {
+      const std::lock_guard<std::mutex> lock(g_known_lock);
+      juce::File kf = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
+                          .getChildFile("m8c/known_plugins.xml");
+      kf.create();
+      if (auto xml = g_known.createXml())
+        xml->writeTo(kf);
+    }
+    std::fprintf(stderr, "[juce_host] scan done: %d plugins known\n",
+                 (int)g_known.getNumTypes());
+    g_scanning.store(false);
+  }
+};
+
+std::unique_ptr<ScanDriver> g_driver;
+
+} // namespace
+
+extern "C" void juce_host_scan(void) {
+  if (g_scanning.load())
+    return;
+  g_scanning.store(true);
+  std::fprintf(stderr, "[juce_host] scanning plugins (out of process)...\n");
+  g_driver = std::make_unique<ScanDriver>();
+  g_driver->startThread();
+}
+
+extern "C" bool juce_host_run_scanner_if_worker(int argc, char **argv) {
+  juce::String cmd;
+  for (int i = 1; i < argc; i++) {
+    cmd << " " << juce::String(argv[i]);
+  }
+  if (!cmd.contains(M8C_SCANNER_TOKEN))
+    return false; // normal app launch
+
+  // We are the isolated scanner worker.
+  wlog("[worker] entered worker mode");
+  new juce::ScopedJuceInitialiser_GUI(); // process exits when done; leak is fine
+  auto *worker = new ScanWorker();
+  if (worker->initialiseFromCommandLine(cmd, M8C_SCANNER_TOKEN)) {
+    wlog("[worker] initialiseFromCommandLine OK, pumping");
+    // runDispatchLoop() returns immediately in this non-JUCEApplication context,
+    // so pump in slices and stay alive until the coordinator disconnects.
+    while (g_worker_alive.load())
+      juce::MessageManager::getInstance()->runDispatchLoopUntil(100);
+    wlog("[worker] exiting");
+    std::exit(0);
+  }
+  wlog("[worker] initialiseFromCommandLine returned FALSE (not a worker)");
+  delete worker;
+  return false;
 }
 
 extern "C" bool juce_host_is_scanning(void) { return g_scanning.load(); }
 
-extern "C" int juce_host_known_count(void) { return g_known.getNumTypes(); }
+extern "C" int juce_host_known_count(void) {
+  const std::lock_guard<std::mutex> lk(g_known_lock);
+  return g_known.getNumTypes();
+}
 
 extern "C" void juce_host_known_label(int index, char *out, int out_size) {
   out[0] = '\0';
+  const std::lock_guard<std::mutex> lk(g_known_lock);
   auto types = g_known.getTypes();
   if (index < 0 || index >= types.size()) return;
   const auto &d = types.getReference(index);
@@ -237,9 +503,13 @@ extern "C" int juce_host_bus_slot_count(int bus) {
 
 extern "C" int juce_host_bus_add(int bus, int known_index) {
   if (bus < 0 || bus >= JUCE_HOST_NUM_BUSES) return -1;
-  auto types = g_known.getTypes();
-  if (known_index < 0 || known_index >= types.size()) return -1;
-  juce::PluginDescription desc = types.getReference(known_index);
+  juce::PluginDescription desc;
+  {
+    const std::lock_guard<std::mutex> lk(g_known_lock);
+    auto types = g_known.getTypes();
+    if (known_index < 0 || known_index >= types.size()) return -1;
+    desc = types.getReference(known_index);
+  }
 
   juce::String err;
   std::unique_ptr<juce::AudioPluginInstance> inst =

@@ -112,6 +112,17 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
 
   juce_host_pump(); // service the JUCE message loop (no-op on macOS for now)
 
+  // REC indicator in the window title, updated on the main thread only
+  // (the recorder is armed/started from the realtime/MIDI thread).
+  {
+    static int last_rec = -1;
+    const int rec = recorder_is_recording() ? 1 : 0;
+    if (rec != last_rec) {
+      renderer_set_title(rec ? "m8c  \xE2\x97\x8F REC" : "m8c");
+      last_rec = rec;
+    }
+  }
+
   switch (ctx->app_state) {
   case INITIALIZE:
     break;
@@ -149,6 +160,12 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
 
 // Initialize the app: initialize context, configs, renderer controllers and attempt to find M8
 SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
+  // If relaunched as the isolated plugin-scanner worker, run it and exit
+  // before any UI/audio/serial is touched.
+  if (juce_host_run_scanner_if_worker(argc, argv)) {
+    return SDL_APP_SUCCESS;
+  }
+
   SDL_SetAppMetadata("M8C",APP_VERSION,"fi.laamaa.m8c");
 
   char *config_filename = NULL;
