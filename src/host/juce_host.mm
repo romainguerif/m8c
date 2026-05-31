@@ -67,6 +67,7 @@ struct Slot {
   juce::PluginDescription desc;
   bool bypassed = false;
   int latency = 0;
+  int proc_channels = 2; // jmax(total in, out): buffer size processBlock needs
 };
 
 struct Bus {
@@ -101,6 +102,9 @@ int g_totalLatency = 0;
 
 DelayLine g_dryDelay;
 juce::AudioBuffer<float> g_dry, g_masterIn;
+// Scratch for plugins whose bus layout needs more than 2 channels (sidechain,
+// etc.): processBlock requires a buffer of jmax(totalIn,totalOut) channels.
+juce::AudioBuffer<float> g_plugin_scratch;
 
 std::vector<std::unique_ptr<juce::DocumentWindow>> g_editorWindows;
 
@@ -128,16 +132,32 @@ void prepare_plugin_locked(Slot &s) {
   s.plugin->setPlayConfigDetails(2, 2, g_sr, g_maxBlock);
   s.plugin->prepareToPlay(g_sr, g_maxBlock);
   s.latency = s.plugin->getLatencySamples();
+  // processBlock requires a buffer with jmax(totalIn,totalOut) channels — some
+  // plugins keep >2 (sidechain/aux) even after setPlayConfigDetails(2,2).
+  s.proc_channels = juce::jlimit(2, 64, juce::jmax(s.plugin->getTotalNumInputChannels(),
+                                                    s.plugin->getTotalNumOutputChannels()));
   // No warm-up processBlock: rendering before the host feeds proper buffers
   // crashes some plugins (e.g. AUs reading a null input in renderGetInput).
 }
 
 void run_chain_locked(Bus &bus, juce::AudioBuffer<float> &buf) {
   juce::MidiBuffer midi;
+  const int n = buf.getNumSamples();
   for (auto &s : bus.slots) {
     if (s.bypassed || !s.plugin) continue;
     midi.clear();
-    s.plugin->processBlock(buf, midi);
+    if (s.proc_channels <= 2) {
+      s.plugin->processBlock(buf, midi);
+    } else {
+      // Widen to the plugin's required channel count; extra channels = silence.
+      g_plugin_scratch.setSize(s.proc_channels, n, false, false, true);
+      g_plugin_scratch.clear();
+      g_plugin_scratch.copyFrom(0, 0, buf, 0, 0, n);
+      g_plugin_scratch.copyFrom(1, 0, buf, 1, 0, n);
+      s.plugin->processBlock(g_plugin_scratch, midi);
+      buf.copyFrom(0, 0, g_plugin_scratch, 0, 0, n);
+      buf.copyFrom(1, 0, g_plugin_scratch, 1, 0, n);
+    }
   }
 }
 
@@ -204,6 +224,7 @@ extern "C" void juce_host_prepare(double sample_rate, int max_block_frames) {
   }
   g_dry.setSize(2, g_maxBlock);
   g_masterIn.setSize(2, g_maxBlock);
+  g_plugin_scratch.setSize(64, g_maxBlock); // headroom so run_chain never reallocs
   g_dryDelay.prepare(2, kMaxDelay);
   recompute_latency_locked();
   g_prepared = true;
