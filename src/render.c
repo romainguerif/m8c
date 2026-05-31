@@ -496,8 +496,13 @@ void render_screen(config_params_s *conf) {
                     SDL_GetError());
   }
 
-  if (!SDL_SetRenderDrawColor(rend, global_background_color.r, global_background_color.g,
-                              global_background_color.b, global_background_color.a)) {
+  // When a full-screen overlay is open, clear the whole window dark so the
+  // 16:9 letterbox/pillarbox bars are covered too (not just the 4:3 area).
+  const bool overlay_open = settings_is_open() || plugin_rack_is_open();
+  if (overlay_open)
+    SDL_SetRenderDrawColor(rend, 0, 0, 0, 255);
+  else if (!SDL_SetRenderDrawColor(rend, global_background_color.r, global_background_color.g,
+                                   global_background_color.b, global_background_color.a)) {
     SDL_LogCritical(SDL_LOG_CATEGORY_RENDER, "Couldn't set render draw color: %s", SDL_GetError());
   }
 

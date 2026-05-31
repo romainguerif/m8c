@@ -578,19 +578,15 @@ static void render_rack(SDL_Renderer *rend, int tw, int th) {
   }
 
   // M8 CC legend (which CCs to use on the M8).
-  inprint(rend, "M8 CC  arm 100   song recall 102   sends 20/21/22 on track ch",
-          MARGIN, th - LINE_H * 3, hdr, 0);
+  inprint(rend, "M8: arm CC100  song CC102  send CC20/21/22@trk", MARGIN, th - LINE_H * 3, hdr, 0);
 
-  // Footer key hints (context-dependent), split to fit the 320px width.
+  // Footer key hints (context-dependent), short to fit the 320px width.
   if (g.focus) {
-    inprint(rend, "Up/Dn pick Q   Left/Right value   Enter assign param", MARGIN, th - LINE_H * 2,
-            dim, 0);
-    inprint(rend, "L MIDI-learn   X clear   P/Esc back", MARGIN, th - LINE_H, dim, 0);
+    inprint(rend, "Up/Dn Q  L/R value  Enter param", MARGIN, th - LINE_H * 2, dim, 0);
+    inprint(rend, "L learn  X clear  P/Esc back", MARGIN, th - LINE_H, dim, 0);
   } else {
-    inprint(rend, "Arrows move  Shift+UpDn reorder  A add  E editor  P params", MARGIN,
-            th - LINE_H * 2, dim, 0);
-    inprint(rend, "B byp  X del  C midi-ch  O songs  S scan  W save  Esc close", MARGIN,
-            th - LINE_H, dim, 0);
+    inprint(rend, "A add  E edit  P params  Sh+UpDn move", MARGIN, th - LINE_H * 2, dim, 0);
+    inprint(rend, "B byp  X del  C ch  O songs  S scan  W save", MARGIN, th - LINE_H, dim, 0);
   }
   char lat[48];
   SDL_snprintf(lat, sizeof(lat), "PDC: %d smp", juce_host_latency_samples());
