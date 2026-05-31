@@ -621,6 +621,11 @@ void show_error_message(const char *message) {
   SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "m8c error", message, win);
 }
 
+void renderer_set_title(const char *title) {
+  if (win != NULL)
+    SDL_SetWindowTitle(win, title);
+}
+
 void renderer_clear_screen(void) {
   SDL_SetRenderDrawColor(rend, global_background_color.r, global_background_color.g,
                          global_background_color.b, global_background_color.a);

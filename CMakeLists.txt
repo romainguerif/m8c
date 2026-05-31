@@ -69,6 +69,12 @@ if (WIN32)
     target_link_libraries(${APP_NAME} ${SDL3_LIBRARIES} ${LIBSERIALPORT_LIBRARIES})
 endif ()
 
+# macOS frameworks: CoreMIDI (recorder trigger) + CoreAudio (24ch capture)
+if (APPLE)
+    target_link_libraries(${APP_NAME} "-framework CoreMIDI" "-framework CoreAudio"
+            "-framework CoreFoundation")
+endif ()
+
 if (APPLE)
     # Destination paths below are relative to ${CMAKE_INSTALL_PREFIX}
     install(TARGETS ${APP_NAME}

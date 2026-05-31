@@ -28,6 +28,9 @@ void display_keyjazz_overlay(uint8_t show, uint8_t base_octave, uint8_t velocity
 
 void show_error_message(const char *message);
 
+// Set the window title (used for the recorder's REC indicator).
+void renderer_set_title(const char *title);
+
 int screensaver_init(void);
 void screensaver_draw(void);
 void screensaver_destroy(void);
