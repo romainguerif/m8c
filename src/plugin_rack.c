@@ -180,6 +180,13 @@ static void trunc_copy(char *dst, const char *src, int maxchars) {
   dst[i] = '\0';
 }
 
+// Draw a solid highlight bar (selection cursor) at a row.
+static void hl_bar(SDL_Renderer *rend, int x, int y, int w) {
+  SDL_SetRenderDrawColor(rend, 0x00, 0xC0, 0xFF, 0xFF); // bright cyan-blue
+  SDL_FRect r = {(float)x, (float)(y - 1), (float)w, (float)LINE_H};
+  SDL_RenderFillRect(rend, &r);
+}
+
 static void render_rack(SDL_Renderer *rend, int tw, int th) {
   const Uint32 fg = 0xFFFFFF, sel = 0x00FFFF, title = 0xFF0000, dim = 0x888888, hdr = 0xAAAAFF;
   const int gx = (int)fonts_get(0)->glyph_x;
@@ -207,7 +214,10 @@ static void render_rack(SDL_Renderer *rend, int tw, int th) {
       } else {
         SDL_snprintf(line, sizeof(line), " ----");
       }
-      Uint32 c = is_sel ? sel : (s < n ? (juce_host_slot_is_bypassed(b, s) ? dim : fg) : dim);
+      if (is_sel)
+        hl_bar(rend, x - 2, y, col_w - 2);
+      Uint32 c = is_sel ? 0x000000
+                        : (s < n ? (juce_host_slot_is_bypassed(b, s) ? dim : fg) : dim);
       inprint(rend, line, x, y, c, 0);
       y += LINE_H;
     }
@@ -252,7 +262,11 @@ static void render_browser(SDL_Renderer *rend, int tw, int th) {
     char raw[160], line[160];
     juce_host_known_label(idx, raw, sizeof(raw));
     trunc_copy(line, raw, maxchars);
-    inprint(rend, line, MARGIN, top + i * LINE_H, idx == g.browser_sel ? sel : fg, 0);
+    const int y = top + i * LINE_H;
+    const bool selrow = (idx == g.browser_sel);
+    if (selrow)
+      hl_bar(rend, 0, y, tw);
+    inprint(rend, line, MARGIN, y, selrow ? 0x000000 : fg, 0);
   }
 
   inprint(rend, "Up/Down  Enter=load  Esc=back  S=rescan", MARGIN, th - LINE_H, dim, 0);
