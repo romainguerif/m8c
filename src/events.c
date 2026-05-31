@@ -3,6 +3,7 @@
 #include "common.h"
 #include "gamepads.h"
 #include "input.h"
+#include "plugin_rack.h"
 #include "render.h"
 #include "settings.h"
 #include <SDL3/SDL.h>
@@ -74,6 +75,15 @@ SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
       settings_handle_event(ctx, event);
       return ret_val;
     }
+    // Toggle the plugin rack overlay (F3), then route to it when open.
+    if (event->key.scancode == SDL_SCANCODE_F3 && event->key.repeat == 0) {
+      plugin_rack_toggle_open();
+      return ret_val;
+    }
+    if (plugin_rack_is_open()) {
+      plugin_rack_handle_event(ctx, event);
+      return ret_val;
+    }
     input_handle_key_down_event(ctx, event);
     break;
 
@@ -81,6 +91,9 @@ SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
     if (settings_is_open()) {
       settings_handle_event(ctx, event);
       return ret_val;
+    }
+    if (plugin_rack_is_open()) {
+      return ret_val; // consume; rack acts on key-down only
     }
     input_handle_key_up_event(ctx, event);
     break;

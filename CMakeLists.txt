@@ -112,6 +112,19 @@ if (APPLE)
             juce::juce_dsp
             juce::juce_recommended_config_flags)
 
+    # macOS frameworks JUCE's audio-plugin + AU-GUI hosting needs.
+    target_link_libraries(m8c_juce_host PUBLIC
+            "-framework Cocoa"
+            "-framework CoreAudio"
+            "-framework CoreAudioKit"
+            "-framework AudioToolbox"
+            "-framework AudioUnit"
+            "-framework CoreMIDI"
+            "-framework QuartzCore"
+            "-framework Accelerate"
+            "-framework Metal"
+            "-framework IOKit")
+
     target_include_directories(${APP_NAME} PRIVATE src/host)
     target_link_libraries(${APP_NAME} m8c_juce_host)
 endif ()

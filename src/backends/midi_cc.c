@@ -1,9 +1,13 @@
 // MIDI Control Change input for the recorder trigger.
 // Released under the MIT licence, https://opensource.org/licenses/MIT
 #include "midi_cc.h"
+#include "juce_host.h"
 #include "recorder.h"
 
 #include <SDL3/SDL.h>
+
+// Send-amount CCs: channel 1-8 = M8 track, CC20/21/22 = send bus 0/1/2.
+#define SEND_CC_BASE 20
 
 #ifdef __APPLE__
 // ---------------------------------------------------------------------------
@@ -62,6 +66,11 @@ static void parse_midi_bytes(const uint8_t *data, int len) {
       if (cc == recorder_arm_cc() &&
           (recorder_arm_channel() == 0 || channel == recorder_arm_channel())) {
         recorder_set_armed(value >= 64);
+      }
+      // Per-track send amounts: channel 1-8 = track, CC20/21/22 = send bus.
+      const int bus = cc - SEND_CC_BASE;
+      if (bus >= 0 && bus < JUCE_HOST_NUM_SENDS && channel >= 1 && channel <= JUCE_HOST_NUM_TRACKS) {
+        juce_host_set_send(channel - 1, bus, (float)value / 127.0f);
       }
       have = 0; // running status: next pair is another CC
     }

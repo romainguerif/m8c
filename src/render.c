@@ -10,6 +10,7 @@
 #include "config.h"
 #include "fx_cube.h"
 #include "log_overlay.h"
+#include "plugin_rack.h"
 #include "settings.h"
 
 #include "fonts/fonts.h"
@@ -478,8 +479,8 @@ int renderer_initialize(config_params_s *conf) {
 }
 
 void render_screen(config_params_s *conf) {
-  if (!dirty && !settings_is_open()) {
-    // No draw commands and settings overlay not active, skip rendering
+  if (!dirty && !settings_is_open() && !plugin_rack_is_open()) {
+    // No draw commands and no overlay active, skip rendering
     return;
   }
 
@@ -517,6 +518,7 @@ void render_screen(config_params_s *conf) {
     if (settings_is_open()) {
       settings_render_overlay(rend, conf, texture_width, texture_height);
     }
+    plugin_rack_render_overlay(rend, texture_width, texture_height);
 
   } else {
     // Ensure that HD texture exists
@@ -549,6 +551,7 @@ void render_screen(config_params_s *conf) {
     if (settings_is_open()) {
       settings_render_overlay(rend, conf, texture_width, texture_height);
     }
+    plugin_rack_render_overlay(rend, texture_width, texture_height);
 
     // Switch the render target back to the window
     if (!SDL_SetRenderTarget(rend, NULL)) {

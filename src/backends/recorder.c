@@ -4,6 +4,7 @@
 
 #include "../ini.h"
 #include "../render.h"
+#include "juce_host.h"
 #include "m8_audio_capture.h"
 #include "ringbuffer.h"
 #include "wav_writer.h"
@@ -48,7 +49,8 @@ static int channels = 0;
 static int sample_rate = 44100;
 static size_t frame_bytes = 0; // channels * (REC_BITS/8)
 
-static int16_t *monitor_tmp = NULL; // capture-thread scratch (stereo)
+static int16_t *monitor_tmp = NULL; // capture-thread scratch (stereo S16)
+static float *host_out = NULL;      // capture-thread scratch (stereo float)
 
 // ---------------------------------------------------------------------------
 // Record-session state (lives while recording)
@@ -154,13 +156,20 @@ static void recorder_on_frames(const float *src, int frames, int ch) {
   if (!capture_ready || frames <= 0)
     return;
 
-  // Master monitor: extract channels 0,1 -> stereo S16, push to output stream.
+  // Master monitor: route through the plugin host (3 sends + master) when
+  // active, else pass the M8 master pair (ch 0,1) straight through.
   if (monitor_stream != NULL) {
     int mf = frames > MON_MAX_FRAMES ? MON_MAX_FRAMES : frames;
-    for (int fr = 0; fr < mf; fr++) {
-      const float *f = src + (size_t)fr * ch;
-      monitor_tmp[2 * fr] = f32_to_s16(f[0]);
-      monitor_tmp[2 * fr + 1] = f32_to_s16(f[1]);
+    if (juce_host_is_active()) {
+      juce_host_process(src, ch, mf, host_out); // interleaved stereo float
+      for (int i = 0; i < mf * 2; i++)
+        monitor_tmp[i] = f32_to_s16(host_out[i]);
+    } else {
+      for (int fr = 0; fr < mf; fr++) {
+        const float *f = src + (size_t)fr * ch;
+        monitor_tmp[2 * fr] = f32_to_s16(f[0]);
+        monitor_tmp[2 * fr + 1] = f32_to_s16(f[1]);
+      }
     }
     SDL_PutAudioStreamData(monitor_stream, monitor_tmp, mf * 2 * (int)sizeof(int16_t));
   }
@@ -434,7 +443,11 @@ bool recorder_open_capture(void) {
   frame_bytes = (size_t)channels * sizeof(float);
 
   monitor_tmp = SDL_malloc((size_t)MON_MAX_FRAMES * 2 * sizeof(int16_t));
+  host_out = SDL_malloc((size_t)MON_MAX_FRAMES * 2 * sizeof(float));
   rb_lock = SDL_CreateMutex();
+
+  // Prepare the plugin host at the capture rate (max block headroom for HAL).
+  juce_host_prepare((double)sample_rate, MON_MAX_FRAMES);
 
   // Master monitor output via SDL (stereo is well within SDL's 8-ch limit).
   if (cfg.monitor_enabled) {
@@ -473,6 +486,10 @@ void recorder_close_capture(void) {
   if (monitor_tmp != NULL) {
     SDL_free(monitor_tmp);
     monitor_tmp = NULL;
+  }
+  if (host_out != NULL) {
+    SDL_free(host_out);
+    host_out = NULL;
   }
   st_armed = st_playing = st_manual = false;
 }
