@@ -508,15 +508,19 @@ static void render_rack(SDL_Renderer *rend, int tw, int th) {
   for (int b = 0; b < JUCE_HOST_NUM_BUSES; b++) {
     int x = b * col_w + 2;
     int y = top;
-    char head[24];
+    const Uint32 hc = (b == g.sel_bus) ? sel : hdr;
+    inprint(rend, BUS_NAMES[b], x, y, hc, 0);
+    y += LINE_H;
+    // 2nd header line: MIDI channel + the M8 send CC for this lane.
+    char sub[24];
     if (b < JUCE_HOST_NUM_SENDS) {
       int mc = juce_host_bus_midi_channel(b);
-      if (mc > 0) SDL_snprintf(head, sizeof(head), "%s c%d", BUS_NAMES[b], mc);
-      else SDL_snprintf(head, sizeof(head), "%s c-", BUS_NAMES[b]);
+      if (mc > 0) SDL_snprintf(sub, sizeof(sub), "ch%d CC%d", mc, 20 + b);
+      else SDL_snprintf(sub, sizeof(sub), "ch- CC%d", 20 + b);
     } else {
-      SDL_snprintf(head, sizeof(head), "%s", BUS_NAMES[b]);
+      SDL_snprintf(sub, sizeof(sub), "out");
     }
-    inprint(rend, head, x, y, b == g.sel_bus ? sel : hdr, 0);
+    inprint(rend, sub, x, y, dim, 0);
     y += LINE_H;
     int cap = juce_host_bus_capacity(b);
     int n = juce_host_bus_slot_count(b);
@@ -543,7 +547,7 @@ static void render_rack(SDL_Renderer *rend, int tw, int th) {
   // --- Quick-params strip for the selected slot (bottom) ---
   const int sel_slot = g.sel_slot[g.sel_bus];
   const bool sel_loaded = sel_slot < juce_host_bus_slot_count(g.sel_bus);
-  int sy = th - LINE_H * 5;
+  int sy = th - LINE_H * 7;
   {
     char sname[40], shead[64];
     if (sel_loaded) {
@@ -573,13 +577,21 @@ static void render_rack(SDL_Renderer *rend, int tw, int th) {
     }
   }
 
-  // Footer hints (context-dependent).
-  if (g.focus)
-    inprint(rend, "Up/Dn=Q  L/R=value  Enter=assign  L=learn  X=clear  P/Esc=back", MARGIN,
+  // M8 CC legend (which CCs to use on the M8).
+  inprint(rend, "M8 CC  arm 100   song recall 102   sends 20/21/22 on track ch",
+          MARGIN, th - LINE_H * 3, hdr, 0);
+
+  // Footer key hints (context-dependent), split to fit the 320px width.
+  if (g.focus) {
+    inprint(rend, "Up/Dn pick Q   Left/Right value   Enter assign param", MARGIN, th - LINE_H * 2,
+            dim, 0);
+    inprint(rend, "L MIDI-learn   X clear   P/Esc back", MARGIN, th - LINE_H, dim, 0);
+  } else {
+    inprint(rend, "Arrows move  Shift+UpDn reorder  A add  E editor  P params", MARGIN,
+            th - LINE_H * 2, dim, 0);
+    inprint(rend, "B byp  X del  C midi-ch  O songs  S scan  W save  Esc close", MARGIN,
             th - LINE_H, dim, 0);
-  else
-    inprint(rend, "Arrows=nav Sh+UpDn=move A=add E=edit P=params B=byp X=del C=midi O=songs S=scan W=save",
-            MARGIN, th - LINE_H, dim, 0);
+  }
   char lat[48];
   SDL_snprintf(lat, sizeof(lat), "PDC: %d smp", juce_host_latency_samples());
   inprint(rend, lat, tw - (int)SDL_strlen(lat) * gx - MARGIN, MARGIN, dim, 0);
