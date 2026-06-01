@@ -64,6 +64,8 @@ void juce_host_push_midi(const unsigned char *data, int len);
 // Transport/tempo from the M8 (for tempo-synced & transport-aware plugins).
 void juce_host_clock(void);                       // one MIDI clock pulse (0xF8)
 void juce_host_transport(bool playing, bool reset); // start(reset)/continue/stop
+int  juce_host_transport_playing(void);           // 1 if transport running
+double juce_host_bpm(void);                        // current tempo estimate
 
 // --- Per-slot quick params: 3 plugin parameters exposed as macros, each
 //     assignable from the parameter list or via MIDI-learn (bind a CC). ---

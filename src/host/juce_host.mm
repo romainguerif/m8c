@@ -855,7 +855,12 @@ extern "C" void juce_host_transport(bool playing, bool reset) {
     g_ppq.store(0.0);
     g_time_samples.store(0);
   }
+  std::fprintf(stderr, "[juce_host] transport %s%s\n", playing ? "PLAY" : "STOP",
+               reset ? " (reset)" : "");
 }
+
+extern "C" int juce_host_transport_playing(void) { return g_playing.load(); }
+extern "C" double juce_host_bpm(void) { return g_bpm.load(); }
 
 // ===========================================================================
 // Realtime processing

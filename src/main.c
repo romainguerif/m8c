@@ -114,14 +114,21 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
   juce_host_pump();    // service the JUCE message loop (no-op on macOS for now)
   plugin_rack_tick();  // startup song auto-load + CC song recalls (main thread)
 
-  // REC indicator in the window title, updated on the main thread only
-  // (the recorder is armed/started from the realtime/MIDI thread).
+  // REC + transport indicator in the window title, updated on the main thread
+  // only (recorder/transport are driven from the realtime/MIDI thread).
   {
-    static int last_rec = -1;
+    static int last_rec = -1, last_play = -1, last_bpm = -1;
     const int rec = recorder_is_recording() ? 1 : 0;
-    if (rec != last_rec) {
-      renderer_set_title(rec ? "m8c  \xE2\x97\x8F REC" : "m8c");
+    const int play = juce_host_transport_playing();
+    const int bpm = (int)(juce_host_bpm() + 0.5);
+    if (rec != last_rec || play != last_play || bpm != last_bpm) {
+      char title[64];
+      SDL_snprintf(title, sizeof(title), "m8c%s%s %d BPM", rec ? "  \xE2\x97\x8F REC" : "",
+                   play ? "  \xE2\x96\xB6" : "  \xE2\x96\xA0", bpm);
+      renderer_set_title(title);
       last_rec = rec;
+      last_play = play;
+      last_bpm = bpm;
     }
   }
 
