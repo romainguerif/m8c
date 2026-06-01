@@ -1,8 +1,11 @@
 #include "events.h"
 #include "backends/m8.h"
+#include "backends/m8_audio_capture.h"
+#include "backends/recorder.h"
 #include "common.h"
 #include "gamepads.h"
 #include "input.h"
+#include "plugin_rack.h"
 #include "render.h"
 #include "settings.h"
 #include <SDL3/SDL.h>
@@ -74,6 +77,54 @@ SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
       settings_handle_event(ctx, event);
       return ret_val;
     }
+    // Toggle the plugin rack overlay (F3), then route to it when open.
+    if (event->key.scancode == SDL_SCANCODE_F3 && event->key.repeat == 0) {
+      plugin_rack_toggle_open();
+      return ret_val;
+    }
+
+    // Toggle monitor output: SDL (default, safe) <-> duplex CoreAudio (lowest
+    // latency, one clock). Global; works with the overlay open.
+    if (event->key.scancode == SDL_SCANCODE_F7 && event->key.repeat == 0) {
+      const int mode = recorder_toggle_monitor_mode();
+      if (mode < 0)
+        renderer_set_title("m8c  monitor: duplex unavailable (input-only)");
+      else
+        renderer_set_title(mode ? "m8c  monitor: DUPLEX (low latency)"
+                                : "m8c  monitor: SDL");
+      return ret_val;
+    }
+
+    // Live audio buffer size: F9 = smaller (lower latency, for live playing),
+    // F10 = larger (more headroom, for full recording). Global; works even
+    // with the rack overlay open.
+    if ((event->key.scancode == SDL_SCANCODE_F9 ||
+         event->key.scancode == SDL_SCANCODE_F10) &&
+        event->key.repeat == 0) {
+      static const int ladder[] = {128, 256, 512, 1024, 2048};
+      const int n = (int)(sizeof(ladder) / sizeof(ladder[0]));
+      const int cur = m8_capture_block_frames();
+      int idx = 0;
+      for (int i = 0; i < n; i++)
+        if (cur >= ladder[i])
+          idx = i;
+      idx += (event->key.scancode == SDL_SCANCODE_F10) ? 1 : -1;
+      if (idx < 0)
+        idx = 0;
+      if (idx >= n)
+        idx = n - 1;
+      const int got = m8_capture_set_block_frames(ladder[idx]);
+      const int rate = m8_capture_rate();
+      char title[64];
+      SDL_snprintf(title, sizeof(title), "m8c  buffer %d smp (%.1f ms)", got,
+                   rate > 0 ? 1000.0 * got / rate : 0.0);
+      renderer_set_title(title);
+      return ret_val;
+    }
+    if (plugin_rack_is_open()) {
+      plugin_rack_handle_event(ctx, event);
+      return ret_val;
+    }
     input_handle_key_down_event(ctx, event);
     break;
 
@@ -82,7 +133,18 @@ SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
       settings_handle_event(ctx, event);
       return ret_val;
     }
+    if (plugin_rack_is_open()) {
+      return ret_val; // consume; rack acts on key-down only
+    }
     input_handle_key_up_event(ctx, event);
+    break;
+
+  case SDL_EVENT_TEXT_INPUT:
+    // Text entry for the plugin rack (naming a song).
+    if (plugin_rack_is_open()) {
+      plugin_rack_handle_event(ctx, event);
+      return ret_val;
+    }
     break;
 
   case SDL_EVENT_GAMEPAD_BUTTON_DOWN:

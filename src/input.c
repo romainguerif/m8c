@@ -4,6 +4,7 @@
 #include "input.h"
 #include "backends/audio.h"
 #include "backends/m8.h"
+#include "backends/recorder.h"
 #include "common.h"
 #include "render.h"
 #include "log_overlay.h"
@@ -204,6 +205,12 @@ void input_handle_key_down_event(struct app_context *ctx, const SDL_Event *event
   if (event->key.scancode == ctx->conf.key_toggle_audio && ctx->device_connected) {
     ctx->conf.audio_enabled = !ctx->conf.audio_enabled;
     audio_toggle(ctx->conf.audio_device_name, ctx->conf.audio_buffer_size);
+    return;
+  }
+
+  // Multitrack recorder manual force toggle (for testing without MIDI).
+  if (event->key.scancode == recorder_record_key_scancode() && ctx->device_connected) {
+    recorder_toggle_manual();
     return;
   }
 

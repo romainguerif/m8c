@@ -10,6 +10,7 @@
 #include "config.h"
 #include "fx_cube.h"
 #include "log_overlay.h"
+#include "plugin_rack.h"
 #include "settings.h"
 
 #include "fonts/fonts.h"
@@ -478,8 +479,8 @@ int renderer_initialize(config_params_s *conf) {
 }
 
 void render_screen(config_params_s *conf) {
-  if (!dirty && !settings_is_open()) {
-    // No draw commands and settings overlay not active, skip rendering
+  if (!dirty && !settings_is_open() && !plugin_rack_is_open()) {
+    // No draw commands and no overlay active, skip rendering
     return;
   }
 
@@ -495,8 +496,13 @@ void render_screen(config_params_s *conf) {
                     SDL_GetError());
   }
 
-  if (!SDL_SetRenderDrawColor(rend, global_background_color.r, global_background_color.g,
-                              global_background_color.b, global_background_color.a)) {
+  // When a full-screen overlay is open, clear the whole window dark so the
+  // 16:9 letterbox/pillarbox bars are covered too (not just the 4:3 area).
+  const bool overlay_open = settings_is_open() || plugin_rack_is_open();
+  if (overlay_open)
+    SDL_SetRenderDrawColor(rend, 0, 0, 0, 255);
+  else if (!SDL_SetRenderDrawColor(rend, global_background_color.r, global_background_color.g,
+                                   global_background_color.b, global_background_color.a)) {
     SDL_LogCritical(SDL_LOG_CATEGORY_RENDER, "Couldn't set render draw color: %s", SDL_GetError());
   }
 
@@ -517,6 +523,7 @@ void render_screen(config_params_s *conf) {
     if (settings_is_open()) {
       settings_render_overlay(rend, conf, texture_width, texture_height);
     }
+    plugin_rack_render_overlay(rend, texture_width, texture_height);
 
   } else {
     // Ensure that HD texture exists
@@ -549,6 +556,7 @@ void render_screen(config_params_s *conf) {
     if (settings_is_open()) {
       settings_render_overlay(rend, conf, texture_width, texture_height);
     }
+    plugin_rack_render_overlay(rend, texture_width, texture_height);
 
     // Switch the render target back to the window
     if (!SDL_SetRenderTarget(rend, NULL)) {
@@ -619,6 +627,11 @@ void renderer_fix_texture_scaling_after_window_resize(config_params_s *conf) {
 
 void show_error_message(const char *message) {
   SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "m8c error", message, win);
+}
+
+void renderer_set_title(const char *title) {
+  if (win != NULL)
+    SDL_SetWindowTitle(win, title);
 }
 
 void renderer_clear_screen(void) {

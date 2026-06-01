@@ -1,4 +1,83 @@
-# m8c
+# M8C
+
+> **A fork of [laamaa/m8c](https://github.com/laamaa/m8c) that turns the M8 display client into a
+> multitrack recorder and an internal VST3/AU effects & instrument host — all driven from the M8 itself.**
+>
+> Built on macOS, entirely with [Claude Code](https://claude.com/claude-code).
+
+M8C keeps everything the original m8c does (mirror the Dirtywave M8 screen, control it from a keyboard/gamepad,
+route its audio) and adds a full production layer around it. The philosophy is *ultra-fluid, minimal-friction*:
+the M8 stays the brain, and M8C is the studio that wraps around it — you barely touch the computer.
+
+## ✨ What this fork adds
+
+### 🎙️ Multitrack recorder
+- Captures **all 24 M8 channels** as **separate 24-bit WAV files** in a single take (SDL caps at 8 channels, so
+  capture goes through **CoreAudio** directly).
+- **Hands-free**: arm with a MIDI CC from the M8 (CC100) — recording starts on transport **Play** and stops on
+  **Stop**. A manual toggle (**F8**) is there for testing.
+- Also records, as their own stereo stems: the **processed (wet) master** and the **3 wet send buses**, so you
+  get the dry tracks *and* the full processed mix in one pass. Silent tracks are dropped automatically.
+
+### 🎛️ Internal VST3 / AU host (JUCE)
+- **3 stereo send-FX chains + 1 master chain**, each an ordered rack of plugins.
+- **Sends controlled live from the M8** by MIDI CC: CC20/21/22 set send 1/2/3, on the MIDI channel that matches
+  the track (channels 1–8 = tracks 1–8).
+- **Plugin Delay Compensation (PDC)**: every send and the dry path are aligned to the longest chain, so nothing
+  drifts out of time when you add latent plugins.
+- **Crash-safe plugin scanning**: plugins are scanned **out-of-process**, so a misbehaving plugin can't take the
+  app down.
+- **Native plugin editor windows** open right from the rack.
+- **Quick params**: 3 macro knobs per plugin slot, each assignable from the parameter list or by **MIDI-learn**.
+
+### 🎹 VST/AU instruments
+- Host **instruments** and play them from the **M8's MIDI** or any **hardware MIDI keyboard**.
+- Routed **by MIDI channel** to the matching lane; instrument audio returns to the master.
+- **MIDI keyboard hot-plug**: connect/disconnect keyboards while running.
+
+### ⏱️ Tempo & transport sync
+- The M8's **MIDI clock** drives the host **tempo (BPM)**, and **Start/Continue/Stop** drive the host
+  **transport**, fed to every plugin through a shared play head.
+- Makes **tempo-synced effects** (delays) lock to the M8, and lets **transport-aware plugins**
+  (e.g. *BassRoom* by Mastering The Mix) start when the M8 plays.
+- The window title shows a live **▶ / ■ + BPM** indicator.
+
+### 🔊 Low-latency monitoring
+- Optional **duplex CoreAudio monitoring** (**F7**): capture + monitor output run in the *same* device callback —
+  one device, one clock, one buffer — for the lowest latency and no inter-device drift. SDL monitoring remains the
+  safe default and you switch between them live.
+- **Live audio buffer size** control: **F9 / F10** step the buffer down/up (128→2048 frames) on the fly — drop it
+  while tracking an instrument, raise it when recording the full mix (`M8C_BLOCK` env var also sets it).
+
+### 💾 Per-song save system
+- Save the whole rig (plugins, sends, params, routing) as a **named song**.
+- Built-in **song browser**, **auto-save**, automatic **reload of the last song** at launch, and **recall by MIDI
+  CC** from the M8 (CC102) — switch your whole setup from the tracker.
+
+### 🖥️ Overlay UI
+- An **m8c-style overlay** with **4 vertical racks** (3 sends + master), matching the M8's look, opened with **F3**.
+- In fullscreen the dark surround fills the whole 16:9 screen.
+
+## 🎚️ Control map
+
+| Control | Action |
+|---|---|
+| **F3** | Open/close the plugin-rack overlay |
+| **F7** | Toggle monitoring: SDL ⇄ duplex CoreAudio (low latency) |
+| **F8** | Manual record toggle (recorder) |
+| **F9 / F10** | Audio buffer size down / up (live) |
+| M8 **CC100** | Arm the recorder (records while transport plays) |
+| M8 **CC20/21/22** @ track channel | Set send 1 / 2 / 3 for that track |
+| M8 **CC102** | Recall a saved song |
+| M8 transport / clock | Drives host transport + tempo (enable **SEND SYNC** on the M8) |
+
+> **Platform note:** the recorder, plugin host and duplex monitoring use **CoreAudio / Core MIDI** and are
+> **macOS-only** for now. The original cross-platform m8c display client is unchanged below. Build with CMake on
+> macOS; see [`docs/vst-host-architecture.md`](docs/vst-host-architecture.md) for the design.
+
+-------
+
+## m8c (upstream)
 
 ## Introduction
 

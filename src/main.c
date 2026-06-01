@@ -15,6 +15,10 @@
 #include "SDL2_inprint.h"
 #include "backends/audio.h"
 #include "backends/m8.h"
+#include "backends/midi_cc.h"
+#include "backends/recorder.h"
+#include "juce_host.h"
+#include "plugin_rack.h"
 #include "common.h"
 #include "config.h"
 #include "gamepads.h"
@@ -41,12 +45,10 @@ static void do_wait_for_device(struct app_context *ctx) {
     ticks_poll_device = SDL_GetTicks();
     if (m8_initialize(0, ctx->preferred_device)) {
 
-      if (ctx->conf.audio_enabled) {
-        if (!audio_initialize(ctx->conf.audio_device_name, ctx->conf.audio_buffer_size)) {
-          SDL_LogError(SDL_LOG_CATEGORY_AUDIO, "Cannot initialize audio");
-          ctx->conf.audio_enabled = 0;
-        }
-      }
+      // M8 connected: the recorder owns the M8 audio (24ch capture + master
+      // monitor back to the M8). Then open its MIDI port for arm/transport.
+      recorder_open_capture();
+      midi_cc_open();
 
       const int m8_enabled = m8_enable_display(1);
       // Device was found; enable display and proceed to the main loop
@@ -109,6 +111,27 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
   struct app_context *ctx = appstate;
   SDL_AppResult app_result = SDL_APP_CONTINUE;
 
+  juce_host_pump();    // service the JUCE message loop (no-op on macOS for now)
+  plugin_rack_tick();  // startup song auto-load + CC song recalls (main thread)
+
+  // REC + transport indicator in the window title, updated on the main thread
+  // only (recorder/transport are driven from the realtime/MIDI thread).
+  {
+    static int last_rec = -1, last_play = -1, last_bpm = -1;
+    const int rec = recorder_is_recording() ? 1 : 0;
+    const int play = juce_host_transport_playing();
+    const int bpm = (int)(juce_host_bpm() + 0.5);
+    if (rec != last_rec || play != last_play || bpm != last_bpm) {
+      char title[64];
+      SDL_snprintf(title, sizeof(title), "m8c%s%s %d BPM", rec ? "  \xE2\x97\x8F REC" : "",
+                   play ? "  \xE2\x96\xB6" : "  \xE2\x96\xA0", bpm);
+      renderer_set_title(title);
+      last_rec = rec;
+      last_play = play;
+      last_bpm = bpm;
+    }
+  }
+
   switch (ctx->app_state) {
   case INITIALIZE:
     break;
@@ -126,6 +149,8 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
     if (result == DEVICE_DISCONNECTED) {
       ctx->device_connected = 0;
       ctx->app_state = WAIT_FOR_DEVICE;
+      recorder_close_capture(); // finalize WAVs if a take was running
+      midi_cc_close();
       audio_close();
     } else if (result == DEVICE_FATAL_ERROR) {
       return SDL_APP_FAILURE;
@@ -144,6 +169,12 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
 
 // Initialize the app: initialize context, configs, renderer controllers and attempt to find M8
 SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
+  // If relaunched as the isolated plugin-scanner worker, run it and exit
+  // before any UI/audio/serial is touched.
+  if (juce_host_run_scanner_if_worker(argc, argv)) {
+    return SDL_APP_SUCCESS;
+  }
+
   SDL_SetAppMetadata("M8C",APP_VERSION,"fi.laamaa.m8c");
 
   char *config_filename = NULL;
@@ -173,10 +204,16 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
   ctx->app_state = INITIALIZE;
   ctx->conf = initialize_config(argc, argv, &ctx->preferred_device, &config_filename);
 
+  // Load multitrack recorder configuration (config/recorder.ini + env).
+  recorder_init();
+
   if (!renderer_initialize(&ctx->conf)) {
     SDL_LogCritical(SDL_LOG_CATEGORY_ERROR, "Failed to initialize renderer.");
     return SDL_APP_FAILURE;
   }
+
+  // Bring up the embedded JUCE host now that SDL/NSApp exists (main thread).
+  juce_host_init();
 
   ctx->device_connected =
       m8_initialize(1, ctx->preferred_device);
@@ -187,9 +224,8 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
   }
 
   if (ctx->device_connected && m8_enable_display(1)) {
-    if (ctx->conf.audio_enabled) {
-      audio_initialize(ctx->conf.audio_device_name, ctx->conf.audio_buffer_size);
-    }
+    recorder_open_capture();
+    midi_cc_open();
     ctx->app_state = RUN;
     render_screen(&ctx->conf);
   } else {
@@ -210,6 +246,10 @@ void SDL_AppQuit(void *appstate, SDL_AppResult result) {
     if (app->app_state == WAIT_FOR_DEVICE) {
       screensaver_destroy();
     }
+    plugin_rack_shutdown(); // save current song while the host state is intact
+    recorder_shutdown();
+    midi_cc_close();
+    juce_host_shutdown();
     if (app->conf.audio_enabled) {
       audio_close();
     }
