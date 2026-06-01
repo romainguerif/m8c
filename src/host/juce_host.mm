@@ -63,6 +63,43 @@ struct DelayLine {
   }
 };
 
+// Collects live MIDI from the MIDI thread and emits it with sample-accurate
+// offsets inside the audio block (same logic as juce::MidiMessageCollector,
+// hand-rolled to avoid pulling in the juce_audio_devices module). Each queued
+// message carries an arrival timestamp (hi-res ms clock, in seconds); on the
+// audio thread we place it at offset = (arrival - blockStart) in samples,
+// clamped to the block, and keep still-future messages for the next block.
+struct MidiQueue {
+  std::mutex m;
+  std::vector<juce::MidiMessage> msgs;
+  double sampleRate = 44100.0;
+  void reset(double sr) {
+    std::lock_guard<std::mutex> lk(m);
+    sampleRate = sr > 0 ? sr : 44100.0;
+    msgs.clear();
+  }
+  void addMessageToQueue(const juce::MidiMessage &msg) { // any thread
+    std::lock_guard<std::mutex> lk(m);
+    if (msgs.size() < 2048)
+      msgs.push_back(msg);
+  }
+  void removeNextBlockOfMessages(juce::MidiBuffer &out, int numSamples) { // audio thread
+    const double now = juce::Time::getMillisecondCounterHiRes() * 0.001;
+    const double blockStart = now - (double)numSamples / sampleRate;
+    std::lock_guard<std::mutex> lk(m);
+    size_t kept = 0;
+    for (auto &msg : msgs) {
+      int s = (int)((msg.getTimeStamp() - blockStart) * sampleRate + 0.5);
+      if (s >= numSamples) { // arrived "in the future": hold for the next block
+        msgs[kept++] = msg;
+        continue;
+      }
+      out.addEvent(msg, s < 0 ? 0 : s);
+    }
+    msgs.resize(kept);
+  }
+};
+
 struct Slot {
   std::unique_ptr<juce::AudioPluginInstance> plugin;
   juce::PluginDescription desc;
@@ -81,8 +118,7 @@ struct Bus {
   DelayLine align;          // applied to this bus' wet output (sends only)
   juce::AudioBuffer<float> buf; // stereo work buffer
   int midi_channel = 0;     // 1-16 = play instruments on this channel; 0 = off
-  std::mutex midi_mutex;                       // guards midi_pending
-  std::vector<juce::MidiMessage> midi_pending; // MIDI thread -> audio thread
+  MidiQueue midiCollector; // sample-accurate live MIDI (see MidiQueue above)
 };
 
 // ---- Host state ----
@@ -255,11 +291,7 @@ extern "C" void juce_host_prepare(double sample_rate, int max_block_frames) {
   for (int b = 0; b < JUCE_HOST_NUM_BUSES; b++) {
     g_buses[b].buf.setSize(2, g_maxBlock);
     g_buses[b].align.prepare(2, kMaxDelay);
-    {
-      std::lock_guard<std::mutex> mlk(g_buses[b].midi_mutex);
-      g_buses[b].midi_pending.clear();
-      g_buses[b].midi_pending.reserve(256);
-    }
+    g_buses[b].midiCollector.reset(g_sr); // sample-accurate MIDI scheduling
     for (auto &s : g_buses[b].slots) prepare_plugin_locked(s);
   }
   g_dry.setSize(2, g_maxBlock);
@@ -717,12 +749,12 @@ extern "C" void juce_host_push_midi(const unsigned char *data, int len) {
   const int ch = msg.getChannel(); // 1-16, or 0 for non-channel messages
 
   // Route notes/CC to instrument lanes on the matching channel (1-16; 0=off).
+  // Stamp with "now" so the collector schedules it sample-accurately in the
+  // block where it actually arrived (vs. dumping everything at sample 0).
+  msg.setTimeStamp(juce::Time::getMillisecondCounterHiRes() * 0.001);
   for (int b = 0; b < JUCE_HOST_NUM_SENDS; b++) {
-    if (g_buses[b].midi_channel != 0 && g_buses[b].midi_channel == ch) {
-      std::lock_guard<std::mutex> mlk(g_buses[b].midi_mutex);
-      if (g_buses[b].midi_pending.size() < 1024)
-        g_buses[b].midi_pending.push_back(msg);
-    }
+    if (g_buses[b].midi_channel != 0 && g_buses[b].midi_channel == ch)
+      g_buses[b].midiCollector.addMessageToQueue(msg);
   }
 
   // Quick-param control: bind on MIDI-learn, else drive bound params.
@@ -924,13 +956,9 @@ extern "C" bool juce_host_process_full(const float *in24, int channels, int fram
         r[i] += in24[i * channels + cr] * g;
       }
     }
+    // Drain queued MIDI for this lane with sample-accurate timing in the block.
     juce::MidiBuffer midi;
-    { // drain queued MIDI for this lane (notes for instruments), at block start
-      std::lock_guard<std::mutex> mlk(bus.midi_mutex);
-      for (auto &m : bus.midi_pending)
-        midi.addEvent(m, 0);
-      bus.midi_pending.clear();
-    }
+    bus.midiCollector.removeNextBlockOfMessages(midi, frames);
     run_chain_locked(bus, bus.buf, midi);
     bus.align.setDelay(maxSend - bus.latency);
     bus.align.process(bus.buf);
