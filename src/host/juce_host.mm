@@ -119,6 +119,7 @@ struct Bus {
   juce::AudioBuffer<float> buf; // stereo work buffer
   int midi_channel = 0;     // 1-16 = play instruments on this channel; 0 = off
   MidiQueue midiCollector; // sample-accurate live MIDI (see MidiQueue above)
+  bool noteActive[128] = {false}; // notes currently held on this lane (MIDI thread only)
 };
 
 // ---- Host state ----
@@ -751,10 +752,29 @@ extern "C" void juce_host_push_midi(const unsigned char *data, int len) {
   // Route notes/CC to instrument lanes on the matching channel (1-16; 0=off).
   // Stamp with "now" so the collector schedules it sample-accurately in the
   // block where it actually arrived (vs. dumping everything at sample 0).
-  msg.setTimeStamp(juce::Time::getMillisecondCounterHiRes() * 0.001);
+  const double now = juce::Time::getMillisecondCounterHiRes() * 0.001;
+  msg.setTimeStamp(now);
+  const bool isOn = msg.isNoteOn();                 // vel > 0
+  const bool isOff = msg.isNoteOff();               // real note-off OR note-on vel 0
+  const int note = (isOn || isOff) ? msg.getNoteNumber() : -1;
   for (int b = 0; b < JUCE_HOST_NUM_SENDS; b++) {
-    if (g_buses[b].midi_channel != 0 && g_buses[b].midi_channel == ch)
-      g_buses[b].midiCollector.addMessageToQueue(msg);
+    if (g_buses[b].midi_channel == 0 || g_buses[b].midi_channel != ch)
+      continue;
+    Bus &bus = g_buses[b];
+    if (isOn && note >= 0) {
+      // Force a retrigger: the M8 holds a note across a sequence loop and
+      // re-sends note-on for the same pitch without an intervening note-off,
+      // which many synths ignore. Inject a note-off first so it re-attacks.
+      if (bus.noteActive[note]) {
+        juce::MidiMessage off = juce::MidiMessage::noteOff(ch, note);
+        off.setTimeStamp(now);
+        bus.midiCollector.addMessageToQueue(off);
+      }
+      bus.noteActive[note] = true;
+    } else if (isOff && note >= 0) {
+      bus.noteActive[note] = false;
+    }
+    bus.midiCollector.addMessageToQueue(msg);
   }
 
   // Quick-param control: bind on MIDI-learn, else drive bound params.

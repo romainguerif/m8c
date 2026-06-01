@@ -30,6 +30,24 @@ static void dispatch_channel_message(uint8_t status, uint8_t d0, uint8_t d1, int
   uint8_t bytes[3] = {status, d0, d1};
   juce_host_push_midi(bytes, 1 + ndata); // routed to instrument lanes by channel
 
+  // Real-time diagnostic: show note on/off + velocity (the "gate") as the M8
+  // sends them. Visible in the in-app log overlay (F2). Enable with M8C_MIDI_DEBUG=1.
+  {
+    static int dbg = -1;
+    if (dbg < 0) {
+      const char *e = SDL_getenv("M8C_MIDI_DEBUG");
+      dbg = (e && e[0] == '1') ? 1 : 0;
+    }
+    if (dbg) {
+      const uint8_t type = status & 0xF0;
+      const int chan = (status & 0x0F) + 1;
+      if (type == 0x90 && d1 > 0)
+        SDL_Log("MIDI note ON  ch%d note=%d vel=%d", chan, d0, d1);
+      else if (type == 0x80 || (type == 0x90 && d1 == 0))
+        SDL_Log("MIDI note OFF ch%d note=%d (vel=%d)", chan, d0, d1);
+    }
+  }
+
   if ((status & 0xF0) == 0xB0) { // Control Change
     const int channel = (status & 0x0F) + 1, cc = d0, value = d1;
     if (cc == recorder_arm_cc() &&
