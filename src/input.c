@@ -17,6 +17,15 @@ static unsigned char keyjazz_velocity = 0x7F;
 static unsigned char keycode = 0; // value of the pressed key
 static input_msg_s key = {normal, 0, 0};
 
+// Which M8 receives keyboard/gamepad input (dual-M8 mode). Always 0 in single
+// mode; toggled by the focus combo when two M8s are connected.
+static int focused_device = 0;
+int input_focused_device(void) { return focused_device; }
+void input_set_focused_device(const int dev) {
+  if (dev >= 0 && dev < M8_MAX_DEVICES)
+    focused_device = dev;
+}
+
 // Store gamepad state
 static struct {
   int current_buttons;
@@ -215,7 +224,7 @@ void input_handle_key_down_event(struct app_context *ctx, const SDL_Event *event
   }
 
   if (event->key.scancode == ctx->conf.key_reset && ctx->device_connected && !keyjazz_enabled) {
-    m8_reset_display();
+    m8_reset_display(input_focused_device());
     return;
   }
 
@@ -278,7 +287,7 @@ void input_handle_gamepad_button(struct app_context *ctx, const SDL_GamepadButto
 
   // Handle special button combinations
   if (gamepad_state.current_buttons == (key_start | key_select | key_opt | key_edit)) {
-    m8_reset_display();
+    m8_reset_display(input_focused_device());
     return;
   }
 
@@ -366,17 +375,17 @@ int input_process_and_send(const struct app_context *ctx) {
   case normal:
     if (input.value != prev_input) {
       prev_input = input.value;
-      m8_send_msg_controller(input.value);
+      m8_send_msg_controller(input_focused_device(), input.value);
     }
     break;
   case keyjazz:
     if (input.value != 0) {
       if (input.value != prev_input) {
         prev_input = input.value;
-        m8_send_msg_keyjazz(input.value, keyjazz_velocity);
+        m8_send_msg_keyjazz(input_focused_device(), input.value, keyjazz_velocity);
       }
     } else {
-      m8_send_msg_keyjazz(0xFF, 0);
+      m8_send_msg_keyjazz(input_focused_device(), 0xFF, 0);
     }
     prev_input = input.value;
     break;

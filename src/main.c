@@ -50,7 +50,7 @@ static void do_wait_for_device(struct app_context *ctx) {
       recorder_open_capture();
       midi_cc_open();
 
-      const int m8_enabled = m8_enable_display(1);
+      const int m8_enabled = m8_enable_display(0, 1);
       // Device was found; enable display and proceed to the main loop
       if (m8_enabled == 1) {
         ctx->app_state = RUN;
@@ -58,7 +58,7 @@ static void do_wait_for_device(struct app_context *ctx) {
         SDL_Delay(100); // Give the display time to initialize
         screensaver_destroy();
         screensaver_initialized = 0;
-        m8_reset_display(); // Avoid display glitches.
+        m8_reset_display(0); // Avoid display glitches.
       } else {
         SDL_LogCritical(SDL_LOG_CATEGORY_ERROR, "Device not detected.");
         ctx->app_state = QUIT;
@@ -145,7 +145,7 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
     if (ctx->app_suspended) {
       return SDL_APP_CONTINUE;
     }
-    const int result = m8_process_data(&ctx->conf);
+    const int result = m8_process_data(0, &ctx->conf);
     if (result == DEVICE_DISCONNECTED) {
       ctx->device_connected = 0;
       ctx->app_state = WAIT_FOR_DEVICE;
@@ -223,7 +223,7 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     return SDL_APP_FAILURE;
   }
 
-  if (ctx->device_connected && m8_enable_display(1)) {
+  if (ctx->device_connected && m8_enable_display(0, 1)) {
     recorder_open_capture();
     midi_cc_open();
     ctx->app_state = RUN;
