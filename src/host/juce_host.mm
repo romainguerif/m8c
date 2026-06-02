@@ -167,6 +167,19 @@ std::atomic<long long> g_time_samples{0};
 // with the captured M8 audio. Default = capture buffer; tunable by ear.
 std::atomic<int> g_playhead_offset{0};
 
+// Second-order Delay-Locked Loop locking the musical position to the M8's MIDI
+// clock (24 pulses/quarter) — the technique from Fons Adriaensen's "Using a DLL
+// to filter time" (used by JACK/Ardour). It tracks the average tempo (no
+// long-term drift) while filtering per-pulse USB jitter (smooth, monotonic).
+// Times in ms (juce::Time::getMillisecondCounterHiRes). Updated on the MIDI
+// thread (juce_host_clock), read on the audio thread (process).
+std::atomic<double> g_dll_t0{0.0};   // filtered time of the pulse at index n0
+std::atomic<double> g_dll_t1{0.0};   // predicted time of the next pulse (loop state)
+std::atomic<double> g_dll_e2{20.833}; // filtered period per pulse (ms); 20.833 = 120 BPM
+std::atomic<long long> g_dll_n0{0};  // pulse index (musical position = n0/24 quarters)
+std::atomic<int> g_dll_state{0};     // 0 = no pulse yet, 1 = one pulse, 2 = locked
+#define DLL_BANDWIDTH_HZ 0.5          // loop bandwidth: heavy smoothing, locks in ~2-3 s
+
 // Shared play head handed to every hosted plugin so tempo-synced effects and
 // transport-aware plugins (e.g. BassRoom) follow the M8.
 struct HostPlayHead : public juce::AudioPlayHead {
@@ -900,34 +913,70 @@ extern "C" bool juce_host_is_learning(void) { return g_learn_quick.load() >= 0; 
 // ===========================================================================
 // Transport / tempo (driven by the M8's MIDI clock + start/stop)
 // ===========================================================================
-// One MIDI clock pulse (0xF8): 24 per quarter note -> derive BPM from timing.
+// One MIDI clock pulse (0xF8): feed the DLL (24 pulses per quarter note). The
+// DLL yields a smooth, drift-free period (-> tempo) and a phase locked to the
+// M8, filtering USB jitter. See Adriaensen, "Using a DLL to filter time".
 extern "C" void juce_host_clock(void) {
-  static double last_ms = 0.0;
-  static double ema = 0.0; // smoothed ms per clock
   const double now = juce::Time::getMillisecondCounterHiRes();
-  if (last_ms > 0.0) {
-    const double dt = now - last_ms;
-    if (dt > 1.0 && dt < 200.0) { // ignore startup/outliers
-      // Heavy smoothing → an accurate *mean* tempo despite per-pulse USB jitter.
-      ema = (ema <= 0.0) ? dt : (ema * 0.95 + dt * 0.05);
-      double bpm = 60000.0 / (ema * 24.0);
-      bpm = std::round(bpm * 10.0) / 10.0; // snap to a 0.1-BPM grid
-      if (bpm > 20.0 && bpm < 400.0) {
-        // Hysteresis: only publish when the tempo really moved, so the value
-        // plugins read stays rock-steady (a jittering BPM makes tempo-synced
-        // delays recompute and wobble).
-        if (std::abs(bpm - g_bpm.load()) >= 0.15)
-          g_bpm.store(bpm);
-      }
-    }
+  const int st = g_dll_state.load();
+
+  if (st == 0) { // first pulse: just anchor the time
+    g_dll_t1.store(now);
+    g_dll_state.store(1);
+    return;
   }
-  last_ms = now;
+  if (st == 1) { // second pulse: seed the period and start the loop
+    double e2 = now - g_dll_t1.load();
+    if (e2 < 1.0 || e2 > 200.0) { // implausible interval -> re-anchor
+      g_dll_t1.store(now);
+      return;
+    }
+    g_dll_e2.store(e2);
+    g_dll_t0.store(now);
+    g_dll_t1.store(now + e2);
+    g_dll_state.store(2);
+    g_bpm.store(60000.0 / (e2 * 24.0));
+    return;
+  }
+
+  // Locked: second-order DLL update (b = sqrt(2)*w, c = w^2, critically damped).
+  double e2 = g_dll_e2.load();
+  double t1 = g_dll_t1.load();
+  const double e = now - t1; // loop error: observed - predicted
+  if (e > 100.0 || e < -100.0) {
+    // Large glitch (transport stutter / dropped pulses): re-anchor, keep tempo.
+    g_dll_t0.store(now);
+    g_dll_t1.store(now + e2);
+    g_dll_n0.fetch_add(1);
+    return;
+  }
+  const double w = 2.0 * M_PI * DLL_BANDWIDTH_HZ * e2 / 1000.0; // per-pulse omega
+  const double b = 1.41421356237 * w;
+  const double c = w * w;
+  const double t0 = t1;
+  t1 += b * e + e2;
+  e2 += c * e;
+  g_dll_t0.store(t0);
+  g_dll_t1.store(t1);
+  g_dll_e2.store(e2);
+  g_dll_n0.fetch_add(1);
+  g_bpm.store(60000.0 / (e2 * 24.0));
 }
 
 // Transport: start (reset=true), continue (reset=false), or stop.
 extern "C" void juce_host_transport(bool playing, bool reset) {
   g_playing.store(playing ? 1 : 0);
   if (reset) {
+    // Restart musical position at 0, re-anchor the DLL phase to "now" but keep
+    // the locked tempo (e2) so the loop doesn't have to re-converge.
+    double e2 = g_dll_e2.load();
+    if (e2 < 1.0 || e2 > 200.0) e2 = 20.833; // fall back to 120 BPM
+    const double now = juce::Time::getMillisecondCounterHiRes();
+    g_dll_e2.store(e2);
+    g_dll_n0.store(0);
+    g_dll_t0.store(now);
+    g_dll_t1.store(now + e2);
+    g_dll_state.store(2);
     g_ppq.store(0.0);
     g_time_samples.store(0);
   }
@@ -973,13 +1022,22 @@ extern "C" bool juce_host_process_full(const float *in24, int channels, int fram
   }
   if (frames > g_maxBlock) frames = g_maxBlock;
 
-  // Advance the play head. The play head is the shared (input-side) transport
-  // for every lane; per-plugin latency is handled separately by the PDC delay
-  // lines, so tempo/transport stay consistent regardless of PDC.
-  g_time_samples.fetch_add(frames);
-  if (g_playing.load()) {
-    const double ppqPerSample = g_bpm.load() / 60.0 / (g_sr > 0 ? g_sr : 44100.0);
-    g_ppq.store(g_ppq.load() + frames * ppqPerSample);
+  // Advance the play head from the DLL: position = pulses locked to the M8's
+  // MIDI clock, so it never drifts. Between pulses we interpolate with the
+  // filtered period e2. (Per-plugin latency is handled by the PDC delay lines;
+  // capture latency by g_playhead_offset — both independent of this.)
+  if (g_playing.load() && g_dll_state.load() == 2) {
+    const double sr = (g_sr > 0 ? g_sr : 44100.0);
+    const double now = juce::Time::getMillisecondCounterHiRes();
+    const double e2 = g_dll_e2.load();
+    const double t0 = g_dll_t0.load();
+    const long long n0 = g_dll_n0.load();
+    double pulses = (double)n0 + (now - t0) / (e2 > 0.0 ? e2 : 20.833);
+    if (pulses < 0.0) pulses = 0.0;
+    const double ppq = pulses / 24.0;
+    const double bpm = g_bpm.load();
+    g_ppq.store(ppq);
+    g_time_samples.store((long long)(ppq * 60.0 / (bpm > 0.0 ? bpm : 120.0) * sr));
   }
 
   // Dry = master pair (ch 0,1).
