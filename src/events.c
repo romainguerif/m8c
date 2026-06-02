@@ -83,6 +83,16 @@ SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
       return ret_val;
     }
 
+    // Dual-M8: Tab switches which M8 the keyboard/gamepad controls.
+    if (event->key.scancode == SDL_SCANCODE_TAB && event->key.repeat == 0 &&
+        m8_device_count() >= 2) {
+      const int next = input_focused_device() ? 0 : 1;
+      input_set_focused_device(next);
+      renderer_set_focus(next);
+      renderer_set_title(next ? "m8c  focus: M8 #2" : "m8c  focus: M8 #1");
+      return ret_val;
+    }
+
     // Toggle monitor output: SDL (default, safe) <-> duplex CoreAudio (lowest
     // latency, one clock). Global; works with the overlay open.
     if (event->key.scancode == SDL_SCANCODE_F7 && event->key.repeat == 0) {

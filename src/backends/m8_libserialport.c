@@ -232,9 +232,9 @@ int m8_initialize(const int verbose, const char *preferred_device) {
     SDL_Log("Looking for USB serial devices");
   }
 
-  // Phase A increment 1: open a single device (rendering can't separate two M8s
-  // yet). Raised to M8_MAX_DEVICES once the renderer supports per-device output.
-  const int max_open = 1;
+  // Open every detected M8 (up to M8_MAX_DEVICES) for dual-M8 mode. A specific
+  // `--dev` forces a single device (handled by the is_preferred break below).
+  const int max_open = (preferred_device != NULL) ? 1 : M8_MAX_DEVICES;
 
   struct sp_port **port_list;
   const enum sp_return port_result = sp_list_ports(&port_list);

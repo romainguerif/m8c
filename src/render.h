@@ -22,6 +22,13 @@ int draw_character(struct draw_character_command *command);
 
 void set_m8_model(unsigned int model);
 
+// Dual-M8 rendering. renderer_set_active_device() selects which M8's texture
+// draw_* target; set the device count and focused device for the split-screen
+// composite. See docs/dual-m8.md.
+void renderer_set_active_device(int dev);
+void renderer_set_device_count(int count);
+void renderer_set_focus(int dev);
+
 void render_screen(config_params_s *conf);
 int toggle_fullscreen(config_params_s *conf);
 void display_keyjazz_overlay(uint8_t show, uint8_t base_octave, uint8_t velocity);

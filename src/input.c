@@ -291,6 +291,15 @@ void input_handle_gamepad_button(struct app_context *ctx, const SDL_GamepadButto
     return;
   }
 
+  // Dual-M8: Select+Opt switches which M8 the gamepad controls.
+  if (pressed && m8_device_count() >= 2 &&
+      gamepad_state.current_buttons == (key_select | key_opt)) {
+    const int next = input_focused_device() ? 0 : 1;
+    input_set_focused_device(next);
+    renderer_set_focus(next);
+    return;
+  }
+
   if (pressed && button == conf->gamepad_quit && gamepad_state.current_buttons == key_select) {
     ctx->app_state = QUIT;
     return;
