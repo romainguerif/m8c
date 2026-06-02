@@ -380,6 +380,165 @@ void m8_capture_stop(void) {
   g_cb = NULL;
 }
 
+// ===========================================================================
+// Secondary capture: a second M8 (e.g. a headless) stereo input.
+// Its own IOProc (its own clock) pushes interleaved stereo float into a
+// lock-free SPSC ring; the recorder (running on the primary M8's clock) reads
+// from it and pads/drops on drift. Used to add the headless's stereo to the
+// multitrack "when it's plugged in".
+// ===========================================================================
+#define CAP2_RING_FRAMES 32768 // stereo frames (~0.7 s @ 44.1k); drift headroom
+
+static AudioObjectID g2_dev = kAudioObjectUnknown;
+static AudioDeviceIOProcID g2_proc = NULL;
+static AudioStreamBasicDescription g2_asbd;
+static int g2_channels = 0;
+static float *g2_ring = NULL; // CAP2_RING_FRAMES * 2 floats
+static SDL_AtomicInt g2_w;     // write index in frames (producer: io_proc2)
+static SDL_AtomicInt g2_r;     // read index in frames (consumer: recorder)
+
+bool m8_capture2_active(void) { return g2_dev != kAudioObjectUnknown && g2_ring != NULL; }
+
+static OSStatus io_proc2(AudioObjectID dev, const AudioTimeStamp *now,
+                         const AudioBufferList *input, const AudioTimeStamp *intime,
+                         AudioBufferList *output, const AudioTimeStamp *outtime, void *client) {
+  (void)dev; (void)now; (void)intime; (void)output; (void)outtime; (void)client;
+  if (input == NULL || input->mNumberBuffers == 0 || g2_ring == NULL)
+    return noErr;
+
+  const int ch = g2_channels;
+  const bool is_float = (g2_asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0;
+  const int bps = (int)(g2_asbd.mBitsPerChannel / 8);
+  const bool noninter = ((int)input->mNumberBuffers == ch);
+  const float s16 = 1.0f / 32768.0f, s32 = 1.0f / 2147483648.0f;
+
+  int frames;
+  if (noninter)
+    frames = (int)(input->mBuffers[0].mDataByteSize / bps);
+  else
+    frames = (int)(input->mBuffers[0].mDataByteSize / (bps * ch));
+  if (frames <= 0)
+    return noErr;
+
+  int w = SDL_GetAtomicInt(&g2_w);
+  const int r = SDL_GetAtomicInt(&g2_r);
+  for (int fr = 0; fr < frames; fr++) {
+    const int next = (w + 1) % CAP2_RING_FRAMES;
+    if (next == r)
+      break; // ring full (consumer behind): drop the rest of this block
+    float lr[2];
+    for (int c = 0; c < 2; c++) {
+      const int sc = (c < ch) ? c : 0; // mono -> duplicate
+      float v;
+      if (noninter) {
+        const void *src = input->mBuffers[sc].mData;
+        v = is_float ? ((const float *)src)[fr]
+                     : (bps == 2 ? ((const int16_t *)src)[fr] * s16
+                                 : ((const int32_t *)src)[fr] * s32);
+      } else {
+        const void *src = input->mBuffers[0].mData;
+        const int i = fr * ch + sc;
+        v = is_float ? ((const float *)src)[i]
+                     : (bps == 2 ? ((const int16_t *)src)[i] * s16
+                                 : ((const int32_t *)src)[i] * s32);
+      }
+      lr[c] = v;
+    }
+    g2_ring[w * 2] = lr[0];
+    g2_ring[w * 2 + 1] = lr[1];
+    w = next;
+  }
+  SDL_SetAtomicInt(&g2_w, w);
+  return noErr;
+}
+
+int m8_capture2_read(float *out, int frames) {
+  if (g2_ring == NULL || frames <= 0)
+    return 0;
+  int r = SDL_GetAtomicInt(&g2_r);
+  const int w = SDL_GetAtomicInt(&g2_w);
+  int avail = (w - r + CAP2_RING_FRAMES) % CAP2_RING_FRAMES;
+  const int n = frames < avail ? frames : avail;
+  for (int i = 0; i < n; i++) {
+    out[i * 2] = g2_ring[r * 2];
+    out[i * 2 + 1] = g2_ring[r * 2 + 1];
+    r = (r + 1) % CAP2_RING_FRAMES;
+  }
+  SDL_SetAtomicInt(&g2_r, r);
+  return n;
+}
+
+bool m8_capture2_start(void) {
+  if (g2_dev != kAudioObjectUnknown)
+    return true; // already running
+
+  // Find an M8 input device that is NOT the primary (g_dev) and has >= 2 ch.
+  AudioObjectPropertyAddress addr = {kAudioHardwarePropertyDevices,
+                                     kAudioObjectPropertyScopeGlobal,
+                                     kAudioObjectPropertyElementMain};
+  UInt32 size = 0;
+  if (AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &addr, 0, NULL, &size) != noErr)
+    return false;
+  const int n = (int)(size / sizeof(AudioObjectID));
+  AudioObjectID *devs = SDL_malloc(size);
+  if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 0, NULL, &size, devs) != noErr) {
+    SDL_free(devs);
+    return false;
+  }
+  AudioObjectID found = kAudioObjectUnknown;
+  for (int i = 0; i < n; i++) {
+    if (devs[i] == g_dev)
+      continue;
+    if (device_input_channels(devs[i]) < 2)
+      continue;
+    char name[256] = {0};
+    if (!device_name(devs[i], name, sizeof(name)) || SDL_strstr(name, "M8") == NULL)
+      continue;
+    found = devs[i];
+    break;
+  }
+  SDL_free(devs);
+  if (found == kAudioObjectUnknown)
+    return false;
+
+  g2_dev = found;
+  AudioObjectPropertyAddress fmt = {kAudioDevicePropertyStreamFormat,
+                                    kAudioObjectPropertyScopeInput,
+                                    kAudioObjectPropertyElementMain};
+  UInt32 fsize = sizeof(g2_asbd);
+  if (AudioObjectGetPropertyData(g2_dev, &fmt, 0, NULL, &fsize, &g2_asbd) != noErr) {
+    g2_dev = kAudioObjectUnknown;
+    return false;
+  }
+  g2_channels = (int)g2_asbd.mChannelsPerFrame;
+  g2_ring = SDL_malloc((size_t)CAP2_RING_FRAMES * 2 * sizeof(float));
+  SDL_SetAtomicInt(&g2_w, 0);
+  SDL_SetAtomicInt(&g2_r, 0);
+
+  if (AudioDeviceCreateIOProcID(g2_dev, io_proc2, NULL, &g2_proc) != noErr || g2_proc == NULL ||
+      AudioDeviceStart(g2_dev, g2_proc) != noErr) {
+    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "m8_capture2: failed to start secondary M8");
+    m8_capture2_stop();
+    return false;
+  }
+  SDL_Log("m8_capture2: secondary M8 stereo capture started (%d ch device)", g2_channels);
+  return true;
+}
+
+void m8_capture2_stop(void) {
+  if (g2_dev != kAudioObjectUnknown && g2_proc != NULL) {
+    AudioDeviceStop(g2_dev, g2_proc);
+    AudioDeviceDestroyIOProcID(g2_dev, g2_proc);
+  }
+  g2_proc = NULL;
+  g2_dev = kAudioObjectUnknown;
+  g2_channels = 0;
+  if (g2_ring != NULL) {
+    SDL_free(g2_ring);
+    g2_ring = NULL;
+  }
+}
+
 #else
 // ---------------------------------------------------------------------------
 // Stub (TODO: ALSA backend for Linux/TrimUI)
@@ -392,4 +551,8 @@ bool m8_capture_start(m8_capture_cb cb) {
 void m8_capture_stop(void) {}
 bool m8_capture_has_output(void) { return false; }
 void m8_capture_set_monitor_duplex(bool on) { (void)on; }
+bool m8_capture2_start(void) { return false; }
+void m8_capture2_stop(void) {}
+bool m8_capture2_active(void) { return false; }
+int m8_capture2_read(float *out, int frames) { (void)out; (void)frames; return 0; }
 #endif
