@@ -10,6 +10,7 @@
 #include <juce_gui_basics/juce_gui_basics.h>
 
 #include <atomic>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -160,28 +161,35 @@ std::atomic<double> g_bpm{120.0};       // derived from MIDI clock (0xF8)
 std::atomic<int> g_playing{0};          // transport running
 std::atomic<double> g_ppq{0.0};         // quarter-note position (advanced on audio thread)
 std::atomic<long long> g_time_samples{0};
+// Capture-latency compensation: the M8's own audio arrives ~one capture buffer
+// late, while playhead-driven plugins (e.g. Strokes' sequencer) generate "now".
+// Retard the reported playhead by this many samples so generated content aligns
+// with the captured M8 audio. Default = capture buffer; tunable by ear.
+std::atomic<int> g_playhead_offset{0};
 
 // Shared play head handed to every hosted plugin so tempo-synced effects and
 // transport-aware plugins (e.g. BassRoom) follow the M8.
 struct HostPlayHead : public juce::AudioPlayHead {
   juce::Optional<PositionInfo> getPosition() const override {
     PositionInfo p;
+    const double sr = (g_sr > 0 ? g_sr : 44100.0);
+    const int off = g_playhead_offset.load();
+    long long t = g_time_samples.load() - off; // retard to match captured M8 audio
+    if (t < 0) t = 0;
+    double ppq = g_ppq.load() - (double)off * g_bpm.load() / 60.0 / sr;
+    if (ppq < 0.0) ppq = 0.0;
     p.setBpm(g_bpm.load());
     p.setTimeSignature(juce::AudioPlayHead::TimeSignature{4, 4});
     p.setIsPlaying(g_playing.load() != 0);
     p.setIsRecording(false);
-    p.setPpqPosition(g_ppq.load());
-    p.setTimeInSamples(g_time_samples.load());
-    p.setTimeInSeconds((double)g_time_samples.load() / (g_sr > 0 ? g_sr : 44100.0));
-    // Diagnostic (rate-limited): proves a plugin actually queries the play head
-    // and shows the exact values it receives. Remove once transport is verified.
-    static std::atomic<double> last_log{0.0};
-    const double now = juce::Time::getMillisecondCounterHiRes();
-    if (now - last_log.load() > 1000.0) {
-      last_log.store(now);
-      std::fprintf(stderr, "[playhead] queried: playing=%d bpm=%.1f ppq=%.2f\n",
-                   g_playing.load(), g_bpm.load(), g_ppq.load());
-    }
+    p.setIsLooping(false);
+    p.setPpqPosition(ppq);
+    // Bar position: required by pattern/step-sequencer plugins (Strokes, etc.)
+    // to align and start their sequence — without it JUCE won't set the VST3
+    // kBarPositionValid flag and many plugins refuse to run their sequencer.
+    p.setPpqPositionOfLastBarStart(std::floor(ppq / 4.0) * 4.0); // 4 beats/bar (4/4)
+    p.setTimeInSamples(t);
+    p.setTimeInSeconds((double)t / sr);
     return p;
   }
 };
@@ -900,10 +908,17 @@ extern "C" void juce_host_clock(void) {
   if (last_ms > 0.0) {
     const double dt = now - last_ms;
     if (dt > 1.0 && dt < 200.0) { // ignore startup/outliers
-      ema = (ema <= 0.0) ? dt : (ema * 0.85 + dt * 0.15);
-      const double bpm = 60000.0 / (ema * 24.0);
-      if (bpm > 20.0 && bpm < 400.0)
-        g_bpm.store(bpm);
+      // Heavy smoothing → an accurate *mean* tempo despite per-pulse USB jitter.
+      ema = (ema <= 0.0) ? dt : (ema * 0.95 + dt * 0.05);
+      double bpm = 60000.0 / (ema * 24.0);
+      bpm = std::round(bpm * 10.0) / 10.0; // snap to a 0.1-BPM grid
+      if (bpm > 20.0 && bpm < 400.0) {
+        // Hysteresis: only publish when the tempo really moved, so the value
+        // plugins read stays rock-steady (a jittering BPM makes tempo-synced
+        // delays recompute and wobble).
+        if (std::abs(bpm - g_bpm.load()) >= 0.15)
+          g_bpm.store(bpm);
+      }
     }
   }
   last_ms = now;
@@ -922,6 +937,16 @@ extern "C" void juce_host_transport(bool playing, bool reset) {
 
 extern "C" int juce_host_transport_playing(void) { return g_playing.load(); }
 extern "C" double juce_host_bpm(void) { return g_bpm.load(); }
+
+// Capture-latency compensation for the play head (samples). Clamped to a sane
+// range. Returns the value in effect.
+extern "C" int juce_host_set_playhead_offset(int samples) {
+  if (samples < 0) samples = 0;
+  if (samples > 48000) samples = 48000; // ~1 s ceiling
+  g_playhead_offset.store(samples);
+  return samples;
+}
+extern "C" int juce_host_playhead_offset(void) { return g_playhead_offset.load(); }
 
 // ===========================================================================
 // Realtime processing

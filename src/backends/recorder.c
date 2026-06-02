@@ -499,6 +499,9 @@ bool recorder_open_capture(void) {
 
   // Prepare the plugin host at the capture rate (max block headroom for HAL).
   juce_host_prepare((double)sample_rate, MON_MAX_FRAMES);
+  // Default capture-latency compensation = one capture buffer, so playhead-
+  // driven plugins (e.g. Strokes) align with the M8's (buffer-late) audio.
+  juce_host_set_playhead_offset(m8_capture_block_frames());
 
   // Master monitor output via SDL (stereo is well within SDL's 8-ch limit).
   if (cfg.monitor_enabled) {

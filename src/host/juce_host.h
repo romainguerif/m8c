@@ -66,6 +66,10 @@ void juce_host_clock(void);                       // one MIDI clock pulse (0xF8)
 void juce_host_transport(bool playing, bool reset); // start(reset)/continue/stop
 int  juce_host_transport_playing(void);           // 1 if transport running
 double juce_host_bpm(void);                        // current tempo estimate
+// Capture-latency compensation (samples) so playhead-driven plugins align with
+// the M8's captured audio. Returns the value actually set.
+int  juce_host_set_playhead_offset(int samples);
+int  juce_host_playhead_offset(void);
 
 // --- Per-slot quick params: 3 plugin parameters exposed as macros, each
 //     assignable from the parameter list or via MIDI-learn (bind a CC). ---
