@@ -26,6 +26,7 @@ typedef struct {
   struct sp_port *port;
   uint8_t serial_buffer[SERIAL_READ_SIZE];
   uint8_t slip_buffer[SERIAL_READ_SIZE];
+  slip_descriptor_s slip_descriptor; // must outlive `slip` (slip stores a pointer to it)
   slip_handler_s slip;
   message_queue_s queue;
   SDL_Thread *thread;
@@ -179,12 +180,12 @@ static int check(const enum sp_return result) {
 // Bring one already-configured device online: SLIP parser, queue, reader thread.
 static int start_device(m8_device_s *d) {
   static const char *thread_names[M8_MAX_DEVICES] = {"SerialThread0", "SerialThread1"};
-  const slip_descriptor_s slip_descriptor = {
-      .buf = d->slip_buffer,
-      .buf_size = sizeof(d->slip_buffer),
-      .recv_message = recv_cb[d->index],
-  };
-  slip_init(&d->slip, &slip_descriptor);
+  // The descriptor must persist for the lifetime of the slip handler (slip
+  // stores a pointer to it), so it lives in the device struct, not on the stack.
+  d->slip_descriptor.buf = d->slip_buffer;
+  d->slip_descriptor.buf_size = sizeof(d->slip_buffer);
+  d->slip_descriptor.recv_message = recv_cb[d->index];
+  slip_init(&d->slip, &d->slip_descriptor);
   init_queue(&d->queue);
   d->should_stop = 0;
   d->thread = SDL_CreateThread(thread_process_serial_data,
