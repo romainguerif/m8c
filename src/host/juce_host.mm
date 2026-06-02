@@ -173,6 +173,15 @@ struct HostPlayHead : public juce::AudioPlayHead {
     p.setPpqPosition(g_ppq.load());
     p.setTimeInSamples(g_time_samples.load());
     p.setTimeInSeconds((double)g_time_samples.load() / (g_sr > 0 ? g_sr : 44100.0));
+    // Diagnostic (rate-limited): proves a plugin actually queries the play head
+    // and shows the exact values it receives. Remove once transport is verified.
+    static std::atomic<double> last_log{0.0};
+    const double now = juce::Time::getMillisecondCounterHiRes();
+    if (now - last_log.load() > 1000.0) {
+      last_log.store(now);
+      std::fprintf(stderr, "[playhead] queried: playing=%d bpm=%.1f ppq=%.2f\n",
+                   g_playing.load(), g_bpm.load(), g_ppq.load());
+    }
     return p;
   }
 };
