@@ -141,20 +141,32 @@ static AudioObjectID find_m8_input_device(void) {
     return kAudioObjectUnknown;
   }
 
-  AudioObjectID exact = kAudioObjectUnknown, substr = kAudioObjectUnknown;
+  // Pick the M8 input device with the MOST channels: with two M8s connected
+  // (e.g. a real M8 + a headless), the real M8 exposes 24 channels while a
+  // headless typically exposes only stereo. We want the rich one for capture.
+  // Log every candidate so the audio topology is visible.
+  AudioObjectID best = kAudioObjectUnknown;
+  int best_ch = 0;
   for (int i = 0; i < n; i++) {
-    if (device_input_channels(devs[i]) < 2)
+    const int ch = device_input_channels(devs[i]);
+    if (ch < 2)
       continue;
     char name[256] = {0};
     if (!device_name(devs[i], name, sizeof(name)))
       continue;
-    if (SDL_strcmp(name, "M8") == 0 && exact == kAudioObjectUnknown)
-      exact = devs[i];
-    else if (SDL_strstr(name, "M8") != NULL && substr == kAudioObjectUnknown)
-      substr = devs[i];
+    if (SDL_strstr(name, "M8") == NULL)
+      continue;
+    SDL_Log("m8_capture: candidate input '%s' (%d ch)", name, ch);
+    // Prefer more channels; on a tie prefer the exact name "M8".
+    if (ch > best_ch || (ch == best_ch && SDL_strcmp(name, "M8") == 0)) {
+      best = devs[i];
+      best_ch = ch;
+    }
   }
   SDL_free(devs);
-  return exact != kAudioObjectUnknown ? exact : substr;
+  if (best != kAudioObjectUnknown)
+    SDL_Log("m8_capture: selected M8 input with %d channels", best_ch);
+  return best;
 }
 
 // Write `mon` (interleaved stereo, `frames` frames) into the device output
