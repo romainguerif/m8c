@@ -1,11 +1,11 @@
 # M8C
 
-[![Built with Claude Code](https://img.shields.io/badge/built%20with-Claude%20Code-d97757)](https://claude.com/claude-code)
+[![Code by Claude Code](https://img.shields.io/badge/code%20by-Claude%20Code-d97757)](https://claude.com/claude-code)
 
 > **A fork of [laamaa/m8c](https://github.com/laamaa/m8c) that turns the M8 display client into a
 > multitrack recorder and an internal VST3/AU effects & instrument host — all driven from the M8 itself.**
 >
-> Designed and written with [Claude Code](https://claude.com/claude-code), on macOS.
+> Design & direction by Romain Guérif — code written by [Claude Code](https://claude.com/claude-code), on macOS.
 
 M8C keeps everything the original m8c does (mirror the Dirtywave M8 screen, control it from a keyboard/gamepad,
 route its audio) and adds a full production layer around it. The philosophy is *ultra-fluid, minimal-friction*:
