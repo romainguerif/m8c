@@ -15,7 +15,24 @@ enum { MODE_RACK, MODE_BROWSER, MODE_PARAMPICK, MODE_SONGS };
 
 #define MAX_SONGS 128
 
-static const char *BUS_NAMES[JUCE_HOST_NUM_BUSES] = {"SEND 1", "SEND 2", "SEND 3", "MASTER"};
+// Names indexed by bus id: 0-2 sends, 3 master, 4-11 track inserts, 12-14 FX
+// return inserts. See docs/per-output-inserts.md.
+static const char *BUS_NAMES[JUCE_HOST_NUM_BUSES] = {
+    "SEND 1", "SEND 2", "SEND 3", "MASTER",
+    "TRK 1",  "TRK 2",  "TRK 3",  "TRK 4", "TRK 5", "TRK 6", "TRK 7", "TRK 8",
+    "MODFX",  "DELAY",  "REVERB"};
+
+// Left-to-right display order (console flow): tracks, FX returns, sends, master.
+static const int DISPLAY_ORDER[JUCE_HOST_NUM_BUSES] = {
+    4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 0, 1, 2, 3};
+#define RACK_VISIBLE_COLS 4 // columns shown at once (strip scrolls horizontally)
+
+static int display_pos(int bus) {
+  for (int i = 0; i < JUCE_HOST_NUM_BUSES; i++)
+    if (DISPLAY_ORDER[i] == bus)
+      return i;
+  return 0;
+}
 
 static struct {
   bool is_open;
@@ -385,14 +402,18 @@ void plugin_rack_handle_event(struct app_context *ctx, const SDL_Event *e) {
   case SDL_SCANCODE_ESCAPE:
     g.is_open = false;
     break;
-  case SDL_SCANCODE_LEFT:
-    if (g.sel_bus > 0) g.sel_bus--;
+  case SDL_SCANCODE_LEFT: {
+    int p = display_pos(g.sel_bus);
+    if (p > 0) g.sel_bus = DISPLAY_ORDER[p - 1];
     clamp_slot();
     break;
-  case SDL_SCANCODE_RIGHT:
-    if (g.sel_bus < JUCE_HOST_NUM_BUSES - 1) g.sel_bus++;
+  }
+  case SDL_SCANCODE_RIGHT: {
+    int p = display_pos(g.sel_bus);
+    if (p < JUCE_HOST_NUM_BUSES - 1) g.sel_bus = DISPLAY_ORDER[p + 1];
     clamp_slot();
     break;
+  }
   case SDL_SCANCODE_UP:
     if (shift) { // Shift+Up = move the plugin up in the chain
       juce_host_bus_move(g.sel_bus, g.sel_slot[g.sel_bus], -1);
@@ -495,30 +516,46 @@ static void hl_bar(SDL_Renderer *rend, int x, int y, int w) {
 static void render_rack(SDL_Renderer *rend, int tw, int th) {
   const Uint32 fg = 0xFFFFFF, sel = 0x00FFFF, title = 0xFF0000, dim = 0x888888, hdr = 0xAAAAFF;
   const int gx = (int)fonts_get(0)->glyph_x;
-  const int col_w = tw / JUCE_HOST_NUM_BUSES;
+  const int col_w = tw / RACK_VISIBLE_COLS;
   const int chars = (col_w - 2) / (gx > 0 ? gx : 6);
 
+  // Horizontal scroll: keep the selected column inside the visible window.
+  const int selpos = display_pos(g.sel_bus);
+  int first = selpos - RACK_VISIBLE_COLS + 1;
+  if (first < 0) first = 0;
+  if (first > JUCE_HOST_NUM_BUSES - RACK_VISIBLE_COLS)
+    first = JUCE_HOST_NUM_BUSES - RACK_VISIBLE_COLS;
+  if (selpos < first) first = selpos;
+
   {
-    char rt[80];
-    SDL_snprintf(rt, sizeof(rt), "PLUGIN RACKS  [%s]", g.cur_song[0] ? g.cur_song : "no song");
+    char rt[96];
+    SDL_snprintf(rt, sizeof(rt), "RACKS [%s]  %d/%d %s", g.cur_song[0] ? g.cur_song : "no song",
+                 selpos + 1, JUCE_HOST_NUM_BUSES,
+                 (first > 0 ? (first + RACK_VISIBLE_COLS < JUCE_HOST_NUM_BUSES ? "<>" : "<")
+                            : (JUCE_HOST_NUM_BUSES > RACK_VISIBLE_COLS ? ">" : "")));
     inprint(rend, rt, MARGIN, MARGIN, title, title);
   }
 
   const int top = MARGIN + LINE_H + 2;
-  for (int b = 0; b < JUCE_HOST_NUM_BUSES; b++) {
-    int x = b * col_w + 2;
+  for (int col = 0; col < RACK_VISIBLE_COLS; col++) {
+    const int b = DISPLAY_ORDER[first + col];
+    int x = col * col_w + 2;
     int y = top;
     const Uint32 hc = (b == g.sel_bus) ? sel : hdr;
     inprint(rend, BUS_NAMES[b], x, y, hc, 0);
     y += LINE_H;
-    // 2nd header line: MIDI channel + the M8 send CC for this lane.
+    // 2nd header line: role / MIDI channel + M8 send CC.
     char sub[24];
     if (b < JUCE_HOST_NUM_SENDS) {
       int mc = juce_host_bus_midi_channel(b);
       if (mc > 0) SDL_snprintf(sub, sizeof(sub), "ch%d CC%d", mc, 20 + b);
       else SDL_snprintf(sub, sizeof(sub), "ch- CC%d", 20 + b);
+    } else if (b == JUCE_HOST_BUS_MASTER) {
+      SDL_snprintf(sub, sizeof(sub), "mix out");
+    } else if (b < JUCE_HOST_INSERT_BASE + JUCE_HOST_NUM_TRACKS) {
+      SDL_snprintf(sub, sizeof(sub), "track in");
     } else {
-      SDL_snprintf(sub, sizeof(sub), "out");
+      SDL_snprintf(sub, sizeof(sub), "fx in");
     }
     inprint(rend, sub, x, y, dim, 0);
     y += LINE_H;
