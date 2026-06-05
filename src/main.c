@@ -22,6 +22,7 @@
 #include "common.h"
 #include "config.h"
 #include "gamepads.h"
+#include "input.h"
 #include "render.h"
 #include "log_overlay.h"
 
@@ -50,7 +51,11 @@ static void do_wait_for_device(struct app_context *ctx) {
       recorder_open_capture();
       midi_cc_open();
 
-      const int m8_enabled = m8_enable_display(1);
+      // Dual-M8: a second M8 (e.g. a headless on another port) is opened too.
+      renderer_set_device_count(m8_device_count());
+      const int m8_enabled = m8_enable_display(0, 1);
+      for (int d = 1; d < m8_device_count(); d++)
+        m8_enable_display(d, 1);
       // Device was found; enable display and proceed to the main loop
       if (m8_enabled == 1) {
         ctx->app_state = RUN;
@@ -58,7 +63,8 @@ static void do_wait_for_device(struct app_context *ctx) {
         SDL_Delay(100); // Give the display time to initialize
         screensaver_destroy();
         screensaver_initialized = 0;
-        m8_reset_display(); // Avoid display glitches.
+        for (int d = 0; d < m8_device_count(); d++)
+          m8_reset_display(d); // Avoid display glitches.
       } else {
         SDL_LogCritical(SDL_LOG_CATEGORY_ERROR, "Device not detected.");
         ctx->app_state = QUIT;
@@ -145,10 +151,21 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
     if (ctx->app_suspended) {
       return SDL_APP_CONTINUE;
     }
-    const int result = m8_process_data(&ctx->conf);
+    // Device 0 drives the app lifecycle (its M8 owns audio/MIDI/recorder).
+    // Additional M8s (dual mode) are display + control only for now.
+    renderer_set_focus(input_focused_device());
+    renderer_set_active_device(0);
+    const int result = m8_process_data(0, &ctx->conf);
+    for (int d = 1; d < m8_device_count(); d++) {
+      renderer_set_active_device(d);
+      m8_process_data(d, &ctx->conf);
+    }
+    renderer_set_active_device(0);
     if (result == DEVICE_DISCONNECTED) {
       ctx->device_connected = 0;
       ctx->app_state = WAIT_FOR_DEVICE;
+      m8_close(); // tear down all devices so polling can re-open cleanly
+      renderer_set_device_count(0);
       recorder_close_capture(); // finalize WAVs if a take was running
       midi_cc_close();
       audio_close();
@@ -223,7 +240,10 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     return SDL_APP_FAILURE;
   }
 
-  if (ctx->device_connected && m8_enable_display(1)) {
+  renderer_set_device_count(m8_device_count());
+  if (ctx->device_connected && m8_enable_display(0, 1)) {
+    for (int d = 1; d < m8_device_count(); d++)
+      m8_enable_display(d, 1);
     recorder_open_capture();
     midi_cc_open();
     ctx->app_state = RUN;

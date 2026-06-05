@@ -16,7 +16,7 @@
 // Tunables
 // ---------------------------------------------------------------------------
 #define REC_BITS 24                  // M8 multichannel USB audio is 24-bit
-#define REC_MAX_FILES 16             // up to 32 channels paired as stereo
+#define REC_MAX_FILES 18             // 16 (real M8) + 1 headless stereo + headroom
 #define DISK_CHUNK_FRAMES 4096       // frames drained per disk-thread pass
 #define RING_SECONDS 4               // ring buffer headroom
 #define SILENCE_PEAK 0.0001f         // tracks under this peak are dropped (~-80 dBFS)
@@ -54,6 +54,8 @@ static int16_t *monitor_tmp = NULL; // capture-thread scratch (stereo S16)
 static float *host_out = NULL;      // capture-thread scratch (stereo float, wet master)
 static float *host_sends = NULL;    // capture-thread scratch (3 sends interleaved = 6 ch)
 static float *cap_combined = NULL;  // capture-thread scratch (rec_channels interleaved)
+static int headless_active = 0;     // 1 when a second M8 (headless) stereo is captured
+static float *headless_tmp = NULL;  // capture-thread scratch (headless stereo, frames*2)
 
 // ---------------------------------------------------------------------------
 // Record-session state (lives while recording)
@@ -107,8 +109,9 @@ static bool mkpath(const char *path) {
 }
 
 static void track_filename(int idx, int total_files, char *out, size_t out_size) {
-  // 24-channel M8 layout: 12 dry stems + processed master + 3 processed sends.
-  if (total_files == 16) {
+  // 24-channel M8 layout: 12 dry stems + processed master + 3 processed sends
+  // (16 files), plus an optional headless stereo pair (17th file).
+  if (total_files == 16 || total_files == 17) {
     switch (idx) {
     case 0: SDL_snprintf(out, out_size, "01_master.wav"); return;
     case 9: SDL_snprintf(out, out_size, "10_modfx.wav"); return;
@@ -118,6 +121,7 @@ static void track_filename(int idx, int total_files, char *out, size_t out_size)
     case 13: SDL_snprintf(out, out_size, "14_send1_wet.wav"); return;
     case 14: SDL_snprintf(out, out_size, "15_send2_wet.wav"); return;
     case 15: SDL_snprintf(out, out_size, "16_send3_wet.wav"); return;
+    case 16: SDL_snprintf(out, out_size, "17_headless.wav"); return; // 2nd M8 stereo
     default: SDL_snprintf(out, out_size, "%02d_track%d.wav", idx + 1, idx); return; // 1-8
     }
   }
@@ -187,7 +191,16 @@ static int recorder_on_frames(const float *src, int frames, int ch, float *out_m
     SDL_PutAudioStreamData(monitor_stream, monitor_tmp, nf * 2 * (int)sizeof(int16_t));
   }
 
-  // Disk: record the raw 24 channels + the wet master (2 extra channels).
+  // Drain the headless's stereo every block (keeps the ring aligned to "now",
+  // independent of the record state). Pad with silence on drift underrun.
+  if (headless_active) {
+    const int got = m8_capture2_read(headless_tmp, nf);
+    for (int i = got * 2; i < nf * 2; i++)
+      headless_tmp[i] = 0.0f;
+  }
+
+  // Disk: record the raw 24 channels + the wet master (2) + 3 send wets (6)
+  // + the headless stereo (2) when a second M8 is connected.
   if (SDL_GetAtomicInt(&recording)) {
     const int ns = 2 * JUCE_HOST_NUM_SENDS;
     for (int fr = 0; fr < nf; fr++) {
@@ -199,6 +212,10 @@ static int recorder_on_frames(const float *src, int frames, int ch, float *out_m
       dst[ch + 1] = host_out[2 * fr + 1]; // master wet R
       for (int k = 0; k < ns; k++)        // send1/2/3 wet L/R
         dst[ch + 2 + k] = host_sends[fr * ns + k];
+      if (headless_active) {              // headless stereo (last pair)
+        dst[ch + 2 + ns] = headless_tmp[2 * fr];
+        dst[ch + 2 + ns + 1] = headless_tmp[2 * fr + 1];
+      }
     }
     const uint32_t bytes = (uint32_t)nf * (uint32_t)frame_bytes;
     SDL_LockMutex(rb_lock);
@@ -464,8 +481,12 @@ bool recorder_open_capture(void) {
     m8_capture_stop();
     return false;
   }
-  // Record: 24 captured channels + processed master (2) + 3 send wets (6).
-  rec_channels = channels + 2 + 2 * JUCE_HOST_NUM_SENDS;
+  // Optional second M8 (e.g. a headless) — record its stereo as an extra track.
+  headless_active = m8_capture2_start() ? 1 : 0;
+
+  // Record: 24 captured channels + processed master (2) + 3 send wets (6)
+  // + the headless stereo (2) when a second M8 is connected.
+  rec_channels = channels + 2 + 2 * JUCE_HOST_NUM_SENDS + (headless_active ? 2 : 0);
   // The ring carries float32 frames of rec_channels (converted to 24-bit on disk).
   frame_bytes = (size_t)rec_channels * sizeof(float);
 
@@ -473,10 +494,14 @@ bool recorder_open_capture(void) {
   host_out = SDL_malloc((size_t)MON_MAX_FRAMES * 2 * sizeof(float));
   host_sends = SDL_malloc((size_t)MON_MAX_FRAMES * 2 * JUCE_HOST_NUM_SENDS * sizeof(float));
   cap_combined = SDL_malloc((size_t)MON_MAX_FRAMES * rec_channels * sizeof(float));
+  headless_tmp = SDL_malloc((size_t)MON_MAX_FRAMES * 2 * sizeof(float));
   rb_lock = SDL_CreateMutex();
 
   // Prepare the plugin host at the capture rate (max block headroom for HAL).
   juce_host_prepare((double)sample_rate, MON_MAX_FRAMES);
+  // Default capture-latency compensation = one capture buffer, so playhead-
+  // driven plugins (e.g. Strokes) align with the M8's (buffer-late) audio.
+  juce_host_set_playhead_offset(m8_capture_block_frames());
 
   // Master monitor output via SDL (stereo is well within SDL's 8-ch limit).
   if (cfg.monitor_enabled) {
@@ -495,15 +520,17 @@ bool recorder_open_capture(void) {
   }
 
   capture_ready = true;
-  SDL_Log("recorder: capture open (%d ch @ %d Hz), monitor %s", channels, sample_rate,
-          monitor_stream ? "on" : "off");
+  SDL_Log("recorder: capture open (%d ch @ %d Hz), monitor %s, headless %s", channels, sample_rate,
+          monitor_stream ? "on" : "off", headless_active ? "yes (+stereo track)" : "no");
   return true;
 }
 
 void recorder_close_capture(void) {
   capture_ready = false;
   rec_end();
+  m8_capture2_stop();
   m8_capture_stop();
+  headless_active = 0;
   if (monitor_stream != NULL) {
     SDL_DestroyAudioStream(monitor_stream);
     monitor_stream = NULL;
@@ -527,6 +554,10 @@ void recorder_close_capture(void) {
   if (cap_combined != NULL) {
     SDL_free(cap_combined);
     cap_combined = NULL;
+  }
+  if (headless_tmp != NULL) {
+    SDL_free(headless_tmp);
+    headless_tmp = NULL;
   }
   st_armed = st_playing = st_manual = false;
 }

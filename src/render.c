@@ -21,6 +21,12 @@ static SDL_Window *win;
 static SDL_Renderer *rend;
 static SDL_Texture *main_texture;
 static SDL_Texture *hd_texture = NULL;
+// Dual-M8 mode: a second M8's display is drawn to aux_texture; draw_* target
+// whichever device is "active". See docs/dual-m8.md.
+static SDL_Texture *aux_texture = NULL;
+static int active_device = 0;   // 0 = main_texture, 1 = aux_texture
+static int g_device_count = 1;  // number of M8s being displayed (1 or 2)
+static int g_focused_device = 0; // which screen has the input focus (for highlight)
 static SDL_Color global_background_color = (SDL_Color){.r = 0x00, .g = 0x00, .b = 0x00, .a = 0x00};
 static SDL_RendererLogicalPresentation window_scaling_mode = SDL_LOGICAL_PRESENTATION_INTEGER_SCALE;
 static SDL_ScaleMode texture_scaling_mode = SDL_SCALEMODE_NEAREST;
@@ -167,6 +173,40 @@ static void change_font(const unsigned int index) {
 // Log overlay API wrappers
 void renderer_log_init(void) { log_overlay_init(); }
 
+// --- Dual-M8 rendering ---------------------------------------------------
+// The second M8's display is drawn to aux_texture (same size as main_texture).
+static void ensure_aux_texture(void) {
+  if (aux_texture != NULL || rend == NULL)
+    return;
+  aux_texture = SDL_CreateTexture(rend, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET,
+                                  texture_width, texture_height);
+  if (aux_texture != NULL) {
+    SDL_SetTextureScaleMode(aux_texture, texture_scaling_mode);
+    SDL_SetRenderTarget(rend, aux_texture);
+    SDL_SetRenderDrawColor(rend, 0, 0, 0, 255);
+    SDL_RenderClear(rend);
+    SDL_SetRenderTarget(rend, main_texture);
+  }
+}
+
+// Select which M8's texture subsequent draw_* commands target. The main loop
+// calls this before draining each device's command queue.
+void renderer_set_active_device(const int dev) {
+  active_device = (dev == 1) ? 1 : 0;
+  if (active_device == 1)
+    ensure_aux_texture();
+  SDL_SetRenderTarget(rend, (active_device == 1 && aux_texture) ? aux_texture : main_texture);
+}
+
+void renderer_set_device_count(const int count) { g_device_count = (count >= 2) ? 2 : 1; }
+void renderer_set_focus(const int dev) {
+  const int d = (dev == 1) ? 1 : 0;
+  if (d != g_focused_device) {
+    g_focused_device = d;
+    dirty = 1; // redraw so the focus border moves immediately
+  }
+}
+
 static void check_and_adjust_window_and_texture_size(const int new_width, const int new_height) {
 
   if (texture_width == new_width && texture_height == new_height) {
@@ -192,6 +232,11 @@ static void check_and_adjust_window_and_texture_size(const int new_width, const 
 
   if (main_texture != NULL) {
     SDL_DestroyTexture(main_texture);
+  }
+  // Drop the second-M8 texture too; it's lazily recreated at the new size.
+  if (aux_texture != NULL) {
+    SDL_DestroyTexture(aux_texture);
+    aux_texture = NULL;
   }
 
   // Notify log overlay to drop its cached texture so it can be recreated with the new size
@@ -244,6 +289,10 @@ void renderer_close(void) {
   inline_font_close();
   if (main_texture != NULL) {
     SDL_DestroyTexture(main_texture);
+  }
+  if (aux_texture != NULL) {
+    SDL_DestroyTexture(aux_texture);
+    aux_texture = NULL;
   }
   if (hd_texture != NULL) {
     SDL_DestroyTexture(hd_texture);
@@ -510,7 +559,36 @@ void render_screen(config_params_s *conf) {
     SDL_LogCritical(SDL_LOG_CATEGORY_RENDER, "Couldn't clear renderer: %s", SDL_GetError());
   }
 
-  if (conf->integer_scaling) {
+  if (g_device_count >= 2) {
+    // Dual-M8: lay the two screens side by side in a logical space twice as
+    // wide; SDL letterboxes it into the window. The focused screen gets a
+    // coloured border. (Bypasses the HD-upscale path; refine later if needed.)
+    SDL_SetRenderLogicalPresentation(rend, texture_width * 2, texture_height, window_scaling_mode);
+    SDL_SetRenderDrawColor(rend, 0, 0, 0, 255);
+    SDL_RenderClear(rend);
+
+    const SDL_FRect left = {0, 0, (float)texture_width, (float)texture_height};
+    const SDL_FRect right = {(float)texture_width, 0, (float)texture_width, (float)texture_height};
+    SDL_RenderTexture(rend, main_texture, NULL, &left);
+    if (aux_texture != NULL)
+      SDL_RenderTexture(rend, aux_texture, NULL, &right);
+
+    // Focus highlight: a 2px border around the active device's screen.
+    const SDL_FRect focused = (g_focused_device == 1) ? right : left;
+    SDL_SetRenderDrawColor(rend, 0xFF, 0xA5, 0x00, 0xFF); // orange
+    for (int i = 0; i < 2; i++) {
+      SDL_FRect b = {focused.x + (float)i, focused.y + (float)i, focused.w - (float)(2 * i),
+                     focused.h - (float)(2 * i)};
+      SDL_RenderRect(rend, &b);
+    }
+
+    // Overlays span the full dual area.
+    log_overlay_render(rend, texture_width * 2, texture_height, texture_scaling_mode, font_mode);
+    if (settings_is_open())
+      settings_render_overlay(rend, conf, texture_width * 2, texture_height);
+    plugin_rack_render_overlay(rend, texture_width * 2, texture_height);
+
+  } else if (conf->integer_scaling) {
     // Direct rendering with integer scaling
     if (!SDL_RenderTexture(rend, main_texture, NULL, NULL)) {
       SDL_LogCritical(SDL_LOG_CATEGORY_RENDER, "Couldn't render texture: %s", SDL_GetError());
@@ -577,7 +655,13 @@ void render_screen(config_params_s *conf) {
     SDL_LogCritical(SDL_LOG_CATEGORY_RENDER, "Couldn't present renderer: %s", SDL_GetError());
   }
 
-  if (!SDL_SetRenderTarget(rend, main_texture)) {
+  // The dual path widened the logical space for the window composite; restore
+  // the 1:1 (texture_width x texture_height) space used when drawing into the
+  // per-device textures, then re-select the active device's texture as target.
+  if (g_device_count >= 2) {
+    SDL_SetRenderLogicalPresentation(rend, texture_width, texture_height, window_scaling_mode);
+  }
+  if (!SDL_SetRenderTarget(rend, (active_device == 1 && aux_texture) ? aux_texture : main_texture)) {
     SDL_LogCritical(SDL_LOG_CATEGORY_RENDER, "Couldn't set renderer target to texture: %s",
                     SDL_GetError());
   }

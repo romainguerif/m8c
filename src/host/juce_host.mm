@@ -10,6 +10,7 @@
 #include <juce_gui_basics/juce_gui_basics.h>
 
 #include <atomic>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -26,6 +27,7 @@ namespace {
 constexpr int kMaxDelay = 16384; // PDC ring size (~371ms @44.1k)
 constexpr int kSendCap = 4;
 constexpr int kMasterCap = 8;
+constexpr int kInsertCap = 8; // per-output insert chain depth
 
 // ---- A simple per-channel delay line for PDC alignment ----
 struct DelayLine {
@@ -63,6 +65,43 @@ struct DelayLine {
   }
 };
 
+// Collects live MIDI from the MIDI thread and emits it with sample-accurate
+// offsets inside the audio block (same logic as juce::MidiMessageCollector,
+// hand-rolled to avoid pulling in the juce_audio_devices module). Each queued
+// message carries an arrival timestamp (hi-res ms clock, in seconds); on the
+// audio thread we place it at offset = (arrival - blockStart) in samples,
+// clamped to the block, and keep still-future messages for the next block.
+struct MidiQueue {
+  std::mutex m;
+  std::vector<juce::MidiMessage> msgs;
+  double sampleRate = 44100.0;
+  void reset(double sr) {
+    std::lock_guard<std::mutex> lk(m);
+    sampleRate = sr > 0 ? sr : 44100.0;
+    msgs.clear();
+  }
+  void addMessageToQueue(const juce::MidiMessage &msg) { // any thread
+    std::lock_guard<std::mutex> lk(m);
+    if (msgs.size() < 2048)
+      msgs.push_back(msg);
+  }
+  void removeNextBlockOfMessages(juce::MidiBuffer &out, int numSamples) { // audio thread
+    const double now = juce::Time::getMillisecondCounterHiRes() * 0.001;
+    const double blockStart = now - (double)numSamples / sampleRate;
+    std::lock_guard<std::mutex> lk(m);
+    size_t kept = 0;
+    for (auto &msg : msgs) {
+      int s = (int)((msg.getTimeStamp() - blockStart) * sampleRate + 0.5);
+      if (s >= numSamples) { // arrived "in the future": hold for the next block
+        msgs[kept++] = msg;
+        continue;
+      }
+      out.addEvent(msg, s < 0 ? 0 : s);
+    }
+    msgs.resize(kept);
+  }
+};
+
 struct Slot {
   std::unique_ptr<juce::AudioPluginInstance> plugin;
   juce::PluginDescription desc;
@@ -81,8 +120,8 @@ struct Bus {
   DelayLine align;          // applied to this bus' wet output (sends only)
   juce::AudioBuffer<float> buf; // stereo work buffer
   int midi_channel = 0;     // 1-16 = play instruments on this channel; 0 = off
-  std::mutex midi_mutex;                       // guards midi_pending
-  std::vector<juce::MidiMessage> midi_pending; // MIDI thread -> audio thread
+  MidiQueue midiCollector; // sample-accurate live MIDI (see MidiQueue above)
+  bool noteActive[128] = {false}; // notes currently held on this lane (MIDI thread only)
 };
 
 // ---- Host state ----
@@ -123,39 +162,73 @@ std::atomic<double> g_bpm{120.0};       // derived from MIDI clock (0xF8)
 std::atomic<int> g_playing{0};          // transport running
 std::atomic<double> g_ppq{0.0};         // quarter-note position (advanced on audio thread)
 std::atomic<long long> g_time_samples{0};
+// Capture-latency compensation: the M8's own audio arrives ~one capture buffer
+// late, while playhead-driven plugins (e.g. Strokes' sequencer) generate "now".
+// Retard the reported playhead by this many samples so generated content aligns
+// with the captured M8 audio. Default = capture buffer; tunable by ear.
+std::atomic<int> g_playhead_offset{0};
+
+// Second-order Delay-Locked Loop locking the musical position to the M8's MIDI
+// clock (24 pulses/quarter) — the technique from Fons Adriaensen's "Using a DLL
+// to filter time" (used by JACK/Ardour). It tracks the average tempo (no
+// long-term drift) while filtering per-pulse USB jitter (smooth, monotonic).
+// Times in ms (juce::Time::getMillisecondCounterHiRes). Updated on the MIDI
+// thread (juce_host_clock), read on the audio thread (process).
+std::atomic<double> g_dll_t0{0.0};   // filtered time of the pulse at index n0
+std::atomic<double> g_dll_t1{0.0};   // predicted time of the next pulse (loop state)
+std::atomic<double> g_dll_e2{20.833}; // filtered period per pulse (ms); 20.833 = 120 BPM
+std::atomic<long long> g_dll_n0{0};  // pulse index (musical position = n0/24 quarters)
+std::atomic<int> g_dll_state{0};     // 0 = no pulse yet, 1 = one pulse, 2 = locked
+#define DLL_BANDWIDTH_HZ 0.5          // loop bandwidth: heavy smoothing, locks in ~2-3 s
 
 // Shared play head handed to every hosted plugin so tempo-synced effects and
 // transport-aware plugins (e.g. BassRoom) follow the M8.
 struct HostPlayHead : public juce::AudioPlayHead {
   juce::Optional<PositionInfo> getPosition() const override {
     PositionInfo p;
+    const double sr = (g_sr > 0 ? g_sr : 44100.0);
+    const int off = g_playhead_offset.load();
+    long long t = g_time_samples.load() - off; // retard to match captured M8 audio
+    if (t < 0) t = 0;
+    double ppq = g_ppq.load() - (double)off * g_bpm.load() / 60.0 / sr;
+    if (ppq < 0.0) ppq = 0.0;
     p.setBpm(g_bpm.load());
     p.setTimeSignature(juce::AudioPlayHead::TimeSignature{4, 4});
     p.setIsPlaying(g_playing.load() != 0);
     p.setIsRecording(false);
-    p.setPpqPosition(g_ppq.load());
-    p.setTimeInSamples(g_time_samples.load());
-    p.setTimeInSeconds((double)g_time_samples.load() / (g_sr > 0 ? g_sr : 44100.0));
+    p.setIsLooping(false);
+    p.setPpqPosition(ppq);
+    // Bar position: required by pattern/step-sequencer plugins (Strokes, etc.)
+    // to align and start their sequence — without it JUCE won't set the VST3
+    // kBarPositionValid flag and many plugins refuse to run their sequencer.
+    p.setPpqPositionOfLastBarStart(std::floor(ppq / 4.0) * 4.0); // 4 beats/bar (4/4)
+    p.setTimeInSamples(t);
+    p.setTimeInSeconds((double)t / sr);
     return p;
   }
 };
 HostPlayHead g_playhead;
 
 // ---- helpers (must hold g_lock) ----
+// Sum of non-bypassed slot latencies for one bus (also stores it on the bus).
+static int bus_latency_locked(int b) {
+  int lat = 0;
+  for (auto &s : g_buses[b].slots)
+    if (!s.bypassed) lat += s.latency;
+  g_buses[b].latency = lat;
+  return lat;
+}
+
 void recompute_latency_locked() {
+  // Two-stage PDC for the console model: inserts -> sends -> master.
+  int maxInsert = 0;
+  for (int b = JUCE_HOST_INSERT_BASE; b < JUCE_HOST_NUM_BUSES; b++)
+    maxInsert = juce::jmax(maxInsert, bus_latency_locked(b));
   int maxSend = 0;
-  for (int b = 0; b < JUCE_HOST_NUM_SENDS; b++) {
-    int lat = 0;
-    for (auto &s : g_buses[b].slots)
-      if (!s.bypassed) lat += s.latency;
-    g_buses[b].latency = lat;
-    maxSend = juce::jmax(maxSend, lat);
-  }
-  int masterLat = 0;
-  for (auto &s : g_buses[JUCE_HOST_BUS_MASTER].slots)
-    if (!s.bypassed) masterLat += s.latency;
-  g_buses[JUCE_HOST_BUS_MASTER].latency = masterLat;
-  g_totalLatency = maxSend + masterLat;
+  for (int b = 0; b < JUCE_HOST_NUM_SENDS; b++)
+    maxSend = juce::jmax(maxSend, bus_latency_locked(b));
+  const int masterLat = bus_latency_locked(JUCE_HOST_BUS_MASTER);
+  g_totalLatency = maxInsert + maxSend + masterLat;
 }
 
 void prepare_plugin_locked(Slot &s) {
@@ -216,8 +289,14 @@ extern "C" void juce_host_init(void) {
     }
   }
   for (int b = 0; b < JUCE_HOST_NUM_BUSES; b++) {
-    g_buses[b].capacity = (b == JUCE_HOST_BUS_MASTER) ? kMasterCap : kSendCap;
-    // Default: send 1/2/3 play MIDI on channels 1/2/3; master off.
+    if (b == JUCE_HOST_BUS_MASTER)
+      g_buses[b].capacity = kMasterCap;
+    else if (b >= JUCE_HOST_INSERT_BASE)
+      g_buses[b].capacity = kInsertCap; // per-output insert chains
+    else
+      g_buses[b].capacity = kSendCap;
+    // Default: send 1/2/3 play MIDI on channels 1/2/3; master + inserts off
+    // (inserts process M8 audio, not MIDI instruments).
     g_buses[b].midi_channel = (b < JUCE_HOST_NUM_SENDS) ? (b + 1) : 0;
   }
   for (int t = 0; t < JUCE_HOST_NUM_TRACKS; t++)
@@ -255,11 +334,7 @@ extern "C" void juce_host_prepare(double sample_rate, int max_block_frames) {
   for (int b = 0; b < JUCE_HOST_NUM_BUSES; b++) {
     g_buses[b].buf.setSize(2, g_maxBlock);
     g_buses[b].align.prepare(2, kMaxDelay);
-    {
-      std::lock_guard<std::mutex> mlk(g_buses[b].midi_mutex);
-      g_buses[b].midi_pending.clear();
-      g_buses[b].midi_pending.reserve(256);
-    }
+    g_buses[b].midiCollector.reset(g_sr); // sample-accurate MIDI scheduling
     for (auto &s : g_buses[b].slots) prepare_plugin_locked(s);
   }
   g_dry.setSize(2, g_maxBlock);
@@ -717,12 +792,31 @@ extern "C" void juce_host_push_midi(const unsigned char *data, int len) {
   const int ch = msg.getChannel(); // 1-16, or 0 for non-channel messages
 
   // Route notes/CC to instrument lanes on the matching channel (1-16; 0=off).
+  // Stamp with "now" so the collector schedules it sample-accurately in the
+  // block where it actually arrived (vs. dumping everything at sample 0).
+  const double now = juce::Time::getMillisecondCounterHiRes() * 0.001;
+  msg.setTimeStamp(now);
+  const bool isOn = msg.isNoteOn();                 // vel > 0
+  const bool isOff = msg.isNoteOff();               // real note-off OR note-on vel 0
+  const int note = (isOn || isOff) ? msg.getNoteNumber() : -1;
   for (int b = 0; b < JUCE_HOST_NUM_SENDS; b++) {
-    if (g_buses[b].midi_channel != 0 && g_buses[b].midi_channel == ch) {
-      std::lock_guard<std::mutex> mlk(g_buses[b].midi_mutex);
-      if (g_buses[b].midi_pending.size() < 1024)
-        g_buses[b].midi_pending.push_back(msg);
+    if (g_buses[b].midi_channel == 0 || g_buses[b].midi_channel != ch)
+      continue;
+    Bus &bus = g_buses[b];
+    if (isOn && note >= 0) {
+      // Force a retrigger: the M8 holds a note across a sequence loop and
+      // re-sends note-on for the same pitch without an intervening note-off,
+      // which many synths ignore. Inject a note-off first so it re-attacks.
+      if (bus.noteActive[note]) {
+        juce::MidiMessage off = juce::MidiMessage::noteOff(ch, note);
+        off.setTimeStamp(now);
+        bus.midiCollector.addMessageToQueue(off);
+      }
+      bus.noteActive[note] = true;
+    } else if (isOff && note >= 0) {
+      bus.noteActive[note] = false;
     }
+    bus.midiCollector.addMessageToQueue(msg);
   }
 
   // Quick-param control: bind on MIDI-learn, else drive bound params.
@@ -831,27 +925,70 @@ extern "C" bool juce_host_is_learning(void) { return g_learn_quick.load() >= 0; 
 // ===========================================================================
 // Transport / tempo (driven by the M8's MIDI clock + start/stop)
 // ===========================================================================
-// One MIDI clock pulse (0xF8): 24 per quarter note -> derive BPM from timing.
+// One MIDI clock pulse (0xF8): feed the DLL (24 pulses per quarter note). The
+// DLL yields a smooth, drift-free period (-> tempo) and a phase locked to the
+// M8, filtering USB jitter. See Adriaensen, "Using a DLL to filter time".
 extern "C" void juce_host_clock(void) {
-  static double last_ms = 0.0;
-  static double ema = 0.0; // smoothed ms per clock
   const double now = juce::Time::getMillisecondCounterHiRes();
-  if (last_ms > 0.0) {
-    const double dt = now - last_ms;
-    if (dt > 1.0 && dt < 200.0) { // ignore startup/outliers
-      ema = (ema <= 0.0) ? dt : (ema * 0.85 + dt * 0.15);
-      const double bpm = 60000.0 / (ema * 24.0);
-      if (bpm > 20.0 && bpm < 400.0)
-        g_bpm.store(bpm);
-    }
+  const int st = g_dll_state.load();
+
+  if (st == 0) { // first pulse: just anchor the time
+    g_dll_t1.store(now);
+    g_dll_state.store(1);
+    return;
   }
-  last_ms = now;
+  if (st == 1) { // second pulse: seed the period and start the loop
+    double e2 = now - g_dll_t1.load();
+    if (e2 < 1.0 || e2 > 200.0) { // implausible interval -> re-anchor
+      g_dll_t1.store(now);
+      return;
+    }
+    g_dll_e2.store(e2);
+    g_dll_t0.store(now);
+    g_dll_t1.store(now + e2);
+    g_dll_state.store(2);
+    g_bpm.store(60000.0 / (e2 * 24.0));
+    return;
+  }
+
+  // Locked: second-order DLL update (b = sqrt(2)*w, c = w^2, critically damped).
+  double e2 = g_dll_e2.load();
+  double t1 = g_dll_t1.load();
+  const double e = now - t1; // loop error: observed - predicted
+  if (e > 100.0 || e < -100.0) {
+    // Large glitch (transport stutter / dropped pulses): re-anchor, keep tempo.
+    g_dll_t0.store(now);
+    g_dll_t1.store(now + e2);
+    g_dll_n0.fetch_add(1);
+    return;
+  }
+  const double w = 2.0 * M_PI * DLL_BANDWIDTH_HZ * e2 / 1000.0; // per-pulse omega
+  const double b = 1.41421356237 * w;
+  const double c = w * w;
+  const double t0 = t1;
+  t1 += b * e + e2;
+  e2 += c * e;
+  g_dll_t0.store(t0);
+  g_dll_t1.store(t1);
+  g_dll_e2.store(e2);
+  g_dll_n0.fetch_add(1);
+  g_bpm.store(60000.0 / (e2 * 24.0));
 }
 
 // Transport: start (reset=true), continue (reset=false), or stop.
 extern "C" void juce_host_transport(bool playing, bool reset) {
   g_playing.store(playing ? 1 : 0);
   if (reset) {
+    // Restart musical position at 0, re-anchor the DLL phase to "now" but keep
+    // the locked tempo (e2) so the loop doesn't have to re-converge.
+    double e2 = g_dll_e2.load();
+    if (e2 < 1.0 || e2 > 200.0) e2 = 20.833; // fall back to 120 BPM
+    const double now = juce::Time::getMillisecondCounterHiRes();
+    g_dll_e2.store(e2);
+    g_dll_n0.store(0);
+    g_dll_t0.store(now);
+    g_dll_t1.store(now + e2);
+    g_dll_state.store(2);
     g_ppq.store(0.0);
     g_time_samples.store(0);
   }
@@ -861,6 +998,16 @@ extern "C" void juce_host_transport(bool playing, bool reset) {
 
 extern "C" int juce_host_transport_playing(void) { return g_playing.load(); }
 extern "C" double juce_host_bpm(void) { return g_bpm.load(); }
+
+// Capture-latency compensation for the play head (samples). Clamped to a sane
+// range. Returns the value in effect.
+extern "C" int juce_host_set_playhead_offset(int samples) {
+  if (samples < 0) samples = 0;
+  if (samples > 48000) samples = 48000; // ~1 s ceiling
+  g_playhead_offset.store(samples);
+  return samples;
+}
+extern "C" int juce_host_playhead_offset(void) { return g_playhead_offset.load(); }
 
 // ===========================================================================
 // Realtime processing
@@ -887,50 +1034,83 @@ extern "C" bool juce_host_process_full(const float *in24, int channels, int fram
   }
   if (frames > g_maxBlock) frames = g_maxBlock;
 
-  // Advance the play head. The play head is the shared (input-side) transport
-  // for every lane; per-plugin latency is handled separately by the PDC delay
-  // lines, so tempo/transport stay consistent regardless of PDC.
-  g_time_samples.fetch_add(frames);
-  if (g_playing.load()) {
-    const double ppqPerSample = g_bpm.load() / 60.0 / (g_sr > 0 ? g_sr : 44100.0);
-    g_ppq.store(g_ppq.load() + frames * ppqPerSample);
+  // Advance the play head from the DLL: position = pulses locked to the M8's
+  // MIDI clock, so it never drifts. Between pulses we interpolate with the
+  // filtered period e2. (Per-plugin latency is handled by the PDC delay lines;
+  // capture latency by g_playhead_offset — both independent of this.)
+  if (g_playing.load() && g_dll_state.load() == 2) {
+    const double sr = (g_sr > 0 ? g_sr : 44100.0);
+    const double now = juce::Time::getMillisecondCounterHiRes();
+    const double e2 = g_dll_e2.load();
+    const double t0 = g_dll_t0.load();
+    const long long n0 = g_dll_n0.load();
+    double pulses = (double)n0 + (now - t0) / (e2 > 0.0 ? e2 : 20.833);
+    if (pulses < 0.0) pulses = 0.0;
+    const double ppq = pulses / 24.0;
+    const double bpm = g_bpm.load();
+    g_ppq.store(ppq);
+    g_time_samples.store((long long)(ppq * 60.0 / (bpm > 0.0 ? bpm : 120.0) * sr));
   }
 
-  // Dry = master pair (ch 0,1).
-  g_dry.setSize(2, frames, false, false, true);
-  for (int i = 0; i < frames; i++) {
-    g_dry.getWritePointer(0)[i] = in24[i * channels + 0];
-    g_dry.getWritePointer(1)[i] = in24[i * channels + 1];
-  }
+  // The M8 must be in multichannel mode for per-output processing; otherwise we
+  // only have the stereo mix (ch 0,1) — fall back to passing that through master.
+  const bool multitrack = channels >= 4;
 
-  // Build + process the 3 send buses from track stems (ch 2..17).
+  // --- Stage 1: per-output insert chains (8 tracks + 3 FX returns) ---
+  // Each insert reads its M8 output pair, runs its chain, and is aligned to the
+  // longest insert so all post-insert outputs are time-coherent.
+  int maxInsert = 0;
+  for (int b = JUCE_HOST_INSERT_BASE; b < JUCE_HOST_NUM_BUSES; b++)
+    maxInsert = juce::jmax(maxInsert, g_buses[b].latency);
+
+  auto run_insert = [&](int busId, int chL, int chR) {
+    Bus &bus = g_buses[busId];
+    bus.buf.setSize(2, frames, false, false, true);
+    if (multitrack && chR < channels) {
+      float *l = bus.buf.getWritePointer(0);
+      float *r = bus.buf.getWritePointer(1);
+      for (int i = 0; i < frames; i++) {
+        l[i] = in24[i * channels + chL];
+        r[i] = in24[i * channels + chR];
+      }
+    } else {
+      bus.buf.clear();
+    }
+    juce::MidiBuffer midi; // inserts process M8 audio, no MIDI
+    run_chain_locked(bus, bus.buf, midi);
+    bus.align.setDelay(maxInsert - bus.latency);
+    bus.align.process(bus.buf);
+  };
+  for (int t = 0; t < JUCE_HOST_NUM_TRACKS; t++)
+    run_insert(JUCE_HOST_TRACK_INSERT(t), 2 + 2 * t, 3 + 2 * t);
+  for (int f = 0; f < JUCE_HOST_NUM_FXRET; f++)
+    run_insert(JUCE_HOST_FXRET_INSERT(f), 18 + 2 * f, 19 + 2 * f);
+
+  // --- Stage 2: send buses, fed from the post-insert tracks ---
   int maxSend = 0;
   for (int b = 0; b < JUCE_HOST_NUM_SENDS; b++)
     maxSend = juce::jmax(maxSend, g_buses[b].latency);
 
   for (int b = 0; b < JUCE_HOST_NUM_SENDS; b++) {
     Bus &bus = g_buses[b];
-    bus.buf.setSize(2, frames, false, false, true); // logical length = frames, no realloc
+    bus.buf.setSize(2, frames, false, false, true);
     bus.buf.clear();
     float *l = bus.buf.getWritePointer(0);
     float *r = bus.buf.getWritePointer(1);
     for (int t = 0; t < JUCE_HOST_NUM_TRACKS; t++) {
       const float g = g_send[t][b].load();
       if (g <= 0.0f) continue;
-      const int cl = 2 + 2 * t, cr = 3 + 2 * t;
-      if (cr >= channels) break;
+      const juce::AudioBuffer<float> &tb = g_buses[JUCE_HOST_TRACK_INSERT(t)].buf;
+      const float *tl = tb.getReadPointer(0);
+      const float *tr = tb.getReadPointer(1);
       for (int i = 0; i < frames; i++) {
-        l[i] += in24[i * channels + cl] * g;
-        r[i] += in24[i * channels + cr] * g;
+        l[i] += tl[i] * g;
+        r[i] += tr[i] * g;
       }
     }
+    // Drain queued MIDI for this lane with sample-accurate timing in the block.
     juce::MidiBuffer midi;
-    { // drain queued MIDI for this lane (notes for instruments), at block start
-      std::lock_guard<std::mutex> mlk(bus.midi_mutex);
-      for (auto &m : bus.midi_pending)
-        midi.addEvent(m, 0);
-      bus.midi_pending.clear();
-    }
+    bus.midiCollector.removeNextBlockOfMessages(midi, frames);
     run_chain_locked(bus, bus.buf, midi);
     bus.align.setDelay(maxSend - bus.latency);
     bus.align.process(bus.buf);
@@ -948,7 +1128,25 @@ extern "C" bool juce_host_process_full(const float *in24, int channels, int fram
     }
   }
 
-  // Align dry to the longest send path, then sum into master input.
+  // --- Master input = Σ(insert outputs) + Σ(sends) ---
+  // Sum the post-insert outputs (all at maxInsert) into the dry bus; with no
+  // multichannel feed, fall back to the M8 stereo mix so we never go silent.
+  g_dry.setSize(2, frames, false, false, true);
+  g_dry.clear();
+  if (multitrack) {
+    for (int b = JUCE_HOST_INSERT_BASE; b < JUCE_HOST_NUM_BUSES; b++) {
+      g_dry.addFrom(0, 0, g_buses[b].buf, 0, 0, frames);
+      g_dry.addFrom(1, 0, g_buses[b].buf, 1, 0, frames);
+    }
+  } else {
+    float *l = g_dry.getWritePointer(0);
+    float *r = g_dry.getWritePointer(1);
+    for (int i = 0; i < frames; i++) {
+      l[i] = in24[i * channels + 0];
+      r[i] = (channels > 1) ? in24[i * channels + 1] : in24[i * channels + 0];
+    }
+  }
+  // Delay the dry sum to align with the (later) send outputs.
   g_dryDelay.setDelay(maxSend);
   g_dryDelay.process(g_dry);
 

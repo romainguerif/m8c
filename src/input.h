@@ -47,6 +47,10 @@ typedef struct input_msg_s {
 
 input_msg_s input_get_msg(config_params_s *conf);
 int input_process_and_send(const struct app_context *ctx);
+
+// Dual-M8 focus: which device keyboard/gamepad input is sent to (0 in single mode).
+int input_focused_device(void);
+void input_set_focused_device(int dev);
 void input_handle_key_down_event(struct app_context *ctx, const SDL_Event *event);
 void input_handle_key_up_event(const struct app_context *ctx, const SDL_Event *event);
 void input_handle_gamepad_button(struct app_context *ctx, SDL_GamepadButton button, bool pressed);

@@ -2,6 +2,7 @@
 #include "backends/m8.h"
 #include "backends/m8_audio_capture.h"
 #include "backends/recorder.h"
+#include "juce_host.h"
 #include "common.h"
 #include "gamepads.h"
 #include "input.h"
@@ -80,6 +81,32 @@ SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
     // Toggle the plugin rack overlay (F3), then route to it when open.
     if (event->key.scancode == SDL_SCANCODE_F3 && event->key.repeat == 0) {
       plugin_rack_toggle_open();
+      return ret_val;
+    }
+
+    // Playhead latency compensation: F5 earlier / F6 later (tune kick-vs-M8
+    // alignment by ear). Step = 1 ms.
+    if ((event->key.scancode == SDL_SCANCODE_F5 ||
+         event->key.scancode == SDL_SCANCODE_F6) &&
+        event->key.repeat == 0) {
+      const int rate = m8_capture_rate() > 0 ? m8_capture_rate() : 44100;
+      const int step = rate / 1000; // 1 ms
+      const int delta = (event->key.scancode == SDL_SCANCODE_F6) ? step : -step;
+      const int now = juce_host_set_playhead_offset(juce_host_playhead_offset() + delta);
+      char title[64];
+      SDL_snprintf(title, sizeof(title), "m8c  playhead comp %.1f ms (%d smp)",
+                   1000.0 * now / rate, now);
+      renderer_set_title(title);
+      return ret_val;
+    }
+
+    // Dual-M8: Tab switches which M8 the keyboard/gamepad controls.
+    if (event->key.scancode == SDL_SCANCODE_TAB && event->key.repeat == 0 &&
+        m8_device_count() >= 2) {
+      const int next = input_focused_device() ? 0 : 1;
+      input_set_focused_device(next);
+      renderer_set_focus(next);
+      renderer_set_title(next ? "m8c  focus: M8 #2" : "m8c  focus: M8 #1");
       return ret_val;
     }
 

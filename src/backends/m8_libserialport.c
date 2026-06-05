@@ -19,68 +19,58 @@
 #define SERIAL_READ_SIZE 1024  // maximum amount of bytes to read from the serial in one pass
 #define SERIAL_READ_DELAY_MS 4 // delay between serial reads in milliseconds
 
-struct sp_port *m8_port = NULL;
-// allocate memory for serial buffers
-static uint8_t serial_buffer[SERIAL_READ_SIZE] = {0};
-static uint8_t slip_buffer[SERIAL_READ_SIZE] = {0};
-static slip_handler_s slip;
-message_queue_s queue;
-
-SDL_Thread *serial_thread = NULL;
-
-// Structure to pass data to the thread
+// Per-M8 connection state. Up to M8_MAX_DEVICES of these run at once (dual-M8
+// mode); each owns its serial port, SLIP parser, message queue and reader
+// thread. See docs/dual-m8.md.
 typedef struct {
-  int should_stop; // Shared stop flag
-} thread_params_s;
+  struct sp_port *port;
+  uint8_t serial_buffer[SERIAL_READ_SIZE];
+  uint8_t slip_buffer[SERIAL_READ_SIZE];
+  slip_descriptor_s slip_descriptor; // must outlive `slip` (slip stores a pointer to it)
+  slip_handler_s slip;
+  message_queue_s queue;
+  SDL_Thread *thread;
+  int should_stop;
+  int index;
+} m8_device_s;
 
-thread_params_s thread_params;
+static m8_device_s g_dev[M8_MAX_DEVICES];
+static int g_count = 0;
+
+int m8_device_count(void) { return g_count; }
 
 // Helper function for error handling
 static int check(enum sp_return result);
 
-static int send_message_to_queue(uint8_t *data, const uint32_t size) {
-  push_message(&queue, data, size);
+// SLIP's recv callback carries no context, so each device gets a tiny dedicated
+// callback that pushes decoded messages to its own queue.
+static int recv_to_queue_0(uint8_t *data, const uint32_t size) {
+  push_message(&g_dev[0].queue, data, size);
   return 1;
 }
-
-static int disconnect() {
-  SDL_Log("Disconnecting M8");
-
-  // wait for the serial processing thread to finish
-  thread_params.should_stop = 1;
-  SDL_WaitThread(serial_thread, NULL);
-  destroy_queue(&queue);
-
-  const unsigned char buf[1] = {'D'};
-
-  int result = sp_blocking_write(m8_port, buf, 1, 5);
-  if (result != 1) {
-    SDL_LogError(SDL_LOG_CATEGORY_SYSTEM, "Error sending disconnect, code %d", result);
-    result = 0;
-  }
-
-  sp_close(m8_port);
-  sp_free_port(m8_port);
-  m8_port = NULL;
-  return result;
+static int recv_to_queue_1(uint8_t *data, const uint32_t size) {
+  push_message(&g_dev[1].queue, data, size);
+  return 1;
 }
+static int (*const recv_cb[M8_MAX_DEVICES])(uint8_t *, uint32_t) = {recv_to_queue_0,
+                                                                    recv_to_queue_1};
 
-static int detect_m8_serial_device(const struct sp_port *m8_port, const char *preferred_device) {
+static int detect_m8_serial_device(const struct sp_port *port, const char *preferred_device) {
   // Check the connection method - we want USB serial devices
-  const enum sp_transport transport = sp_get_port_transport(m8_port);
- 
+  const enum sp_transport transport = sp_get_port_transport(port);
+
   if (transport == SP_TRANSPORT_USB) {
     // If a preferred device is specified, check if this port matches it
     if (preferred_device != NULL) {
-      const char *port_name = sp_get_port_name(m8_port);
+      const char *port_name = sp_get_port_name(port);
       if (strcmp(preferred_device, port_name) == 0) {
-        return 1;  // Force return 1 for preferred device
+        return 1; // Force return 1 for preferred device
       }
     }
-    
+
     // Get the USB vendor and product IDs.
     int usb_vid, usb_pid;
-    sp_get_port_usb_vid_pid(m8_port, &usb_vid, &usb_pid);
+    sp_get_port_usb_vid_pid(port, &usb_vid, &usb_pid);
 
     if (usb_vid == 0x16C0 && (usb_pid == 0x048A || usb_pid == 0x048B))
       return 1;
@@ -89,15 +79,14 @@ static int detect_m8_serial_device(const struct sp_port *m8_port, const char *pr
   return 0;
 }
 
-// Checks for connected devices and whether the specified device still exists
-static int serial_port_connected() {
+// Checks whether the given device's port still exists among connected ports.
+static int serial_port_connected(const m8_device_s *d) {
+  if (d->port == NULL)
+    return 0;
 
   int device_found = 0;
-
   struct sp_port **port_list;
-
   const enum sp_return result = sp_list_ports(&port_list);
-
   if (result != SP_OK) {
     SDL_LogError(SDL_LOG_CATEGORY_SYSTEM, "sp_list_ports() failed!\n");
     abort();
@@ -105,9 +94,8 @@ static int serial_port_connected() {
 
   for (int i = 0; port_list[i] != NULL; i++) {
     const struct sp_port *port = port_list[i];
-
     if (detect_m8_serial_device(port, NULL)) {
-      if (strcmp(sp_get_port_name(port), sp_get_port_name(m8_port)) == 0)
+      if (strcmp(sp_get_port_name(port), sp_get_port_name(d->port)) == 0)
         device_found = 1;
     }
   }
@@ -127,23 +115,21 @@ static void process_received_bytes(const uint8_t *buffer, int bytes_read, slip_h
   }
 }
 
+// Reader thread: one per device. On a read error it stops; the main loop reaps
+// the disconnection (never frees the port from this thread to avoid races).
 static int thread_process_serial_data(void *data) {
-  const thread_params_s *thread_params = data;
-
-  while (!thread_params->should_stop) {
-    // attempt to read from serial port
-    const int bytes_read = sp_nonblocking_read(m8_port, serial_buffer, SERIAL_READ_SIZE);
-
+  m8_device_s *d = data;
+  while (!d->should_stop) {
+    const int bytes_read = sp_nonblocking_read(d->port, d->serial_buffer, SERIAL_READ_SIZE);
     if (bytes_read < 0) {
-      SDL_LogCritical(SDL_LOG_CATEGORY_ERROR, "Error %d reading serial.", bytes_read);
-      disconnect();
+      SDL_LogCritical(SDL_LOG_CATEGORY_ERROR, "Error %d reading serial (device %d).", bytes_read,
+                      d->index);
+      d->should_stop = 1;
       return 0;
     }
-
     if (bytes_read > 0) {
-      process_received_bytes(serial_buffer, bytes_read, &slip);
+      process_received_bytes(d->serial_buffer, bytes_read, &d->slip);
     }
-
     SDL_Delay(SERIAL_READ_DELAY_MS);
   }
   return 1;
@@ -191,125 +177,145 @@ static int check(const enum sp_return result) {
   return result;
 }
 
-// Extracted function for initializing threads and message queue
-static int initialize_serial_thread() {
-
-  init_queue(&queue);
-  serial_thread = SDL_CreateThread(thread_process_serial_data, "SerialThread", &thread_params);
-
-  if (!serial_thread) {
+// Bring one already-configured device online: SLIP parser, queue, reader thread.
+static int start_device(m8_device_s *d) {
+  static const char *thread_names[M8_MAX_DEVICES] = {"SerialThread0", "SerialThread1"};
+  // The descriptor must persist for the lifetime of the slip handler (slip
+  // stores a pointer to it), so it lives in the device struct, not on the stack.
+  d->slip_descriptor.buf = d->slip_buffer;
+  d->slip_descriptor.buf_size = sizeof(d->slip_buffer);
+  d->slip_descriptor.recv_message = recv_cb[d->index];
+  slip_init(&d->slip, &d->slip_descriptor);
+  init_queue(&d->queue);
+  d->should_stop = 0;
+  d->thread = SDL_CreateThread(thread_process_serial_data,
+                               thread_names[d->index < M8_MAX_DEVICES ? d->index : 0], d);
+  if (!d->thread) {
     SDL_LogError(SDL_LOG_CATEGORY_SYSTEM, "SDL_CreateThread Error: %s", SDL_GetError());
-    SDL_Quit();
     return 0;
   }
-
-  thread_params.should_stop = 0;
-
   return 1;
 }
 
-// Extracted function for detecting and selecting the M8 device
-static int find_and_select_device(const char *preferred_device) {
-  struct sp_port **port_list;
-  const enum sp_return port_result = sp_list_ports(&port_list);
-
-  if (port_result != SP_OK) {
-    SDL_LogError(SDL_LOG_CATEGORY_SYSTEM, "sp_list_ports() failed!");
+// Tear down one device (main thread only). Sends the disconnect byte, joins the
+// reader thread, frees the queue and port.
+static int disconnect_device(m8_device_s *d) {
+  if (d->port == NULL)
     return 0;
+  SDL_Log("Disconnecting M8 (device %d)", d->index);
+
+  d->should_stop = 1;
+  if (d->thread != NULL) {
+    SDL_WaitThread(d->thread, NULL);
+    d->thread = NULL;
   }
+  destroy_queue(&d->queue);
 
-  for (int i = 0; port_list[i] != NULL; i++) {
-    const struct sp_port *port = port_list[i];
-
-    if (detect_m8_serial_device(port, preferred_device)) {
-      char *port_name = sp_get_port_name(port);
-      SDL_Log("Found M8 in %s", port_name);
-      sp_copy_port(port, &m8_port);
-
-      // Break if preferred device is found
-      if (preferred_device != NULL && strcmp(preferred_device, port_name) == 0) {
-        SDL_Log("Found preferred device, breaking");
-        break;
-      }
-    }
+  const unsigned char buf[1] = {'D'};
+  int result = sp_blocking_write(d->port, buf, 1, 5);
+  if (result != 1) {
+    SDL_LogError(SDL_LOG_CATEGORY_SYSTEM, "Error sending disconnect, code %d", result);
+    result = 0;
   }
-
-  sp_free_port_list(port_list);
-  return (m8_port != NULL);
+  sp_close(d->port);
+  sp_free_port(d->port);
+  d->port = NULL;
+  return result;
 }
 
 int m8_initialize(const int verbose, const char *preferred_device) {
-  if (m8_port != NULL) {
-    // Port is already initialized
-    return 1;
+  if (g_count > 0) {
+    // Already initialized
+    return g_count;
   }
-
-  // Initialize slip descriptor
-  static const slip_descriptor_s slip_descriptor = {
-      .buf = slip_buffer,
-      .buf_size = sizeof(slip_buffer),
-      .recv_message = send_message_to_queue,
-  };
-  slip_init(&slip, &slip_descriptor);
 
   if (verbose) {
     SDL_Log("Looking for USB serial devices");
   }
 
-  // Detect and select M8 device
-  if (!find_and_select_device(preferred_device)) {
-    if (verbose) {
-      SDL_LogError(SDL_LOG_CATEGORY_SYSTEM, "Cannot find a M8");
+  // Open every detected M8 (up to M8_MAX_DEVICES) for dual-M8 mode. A specific
+  // `--dev` forces a single device (handled by the is_preferred break below).
+  const int max_open = (preferred_device != NULL) ? 1 : M8_MAX_DEVICES;
+
+  struct sp_port **port_list;
+  const enum sp_return port_result = sp_list_ports(&port_list);
+  if (port_result != SP_OK) {
+    SDL_LogError(SDL_LOG_CATEGORY_SYSTEM, "sp_list_ports() failed!");
+    return 0;
+  }
+
+  g_count = 0;
+  for (int i = 0; port_list[i] != NULL && g_count < max_open; i++) {
+    const struct sp_port *port = port_list[i];
+    if (!detect_m8_serial_device(port, preferred_device))
+      continue;
+
+    const char *port_name = sp_get_port_name(port);
+    const int is_preferred = (preferred_device != NULL && strcmp(preferred_device, port_name) == 0);
+
+    m8_device_s *d = &g_dev[g_count];
+    memset(d, 0, sizeof(*d));
+    d->index = g_count;
+    if (sp_copy_port(port, &d->port) != SP_OK || d->port == NULL)
+      continue;
+
+    SDL_Log("Found M8 in %s (device %d)", port_name, d->index);
+    if (!configure_serial_port(d->port) || !start_device(d)) {
+      sp_free_port(d->port);
+      d->port = NULL;
+      continue;
     }
-    return 0;
+    g_count++;
+
+    if (is_preferred) {
+      // Honour --dev: open only the requested device.
+      break;
+    }
   }
 
-  // Configure serial port
-  if (!configure_serial_port(m8_port)) {
-    return 0;
-  }
+  sp_free_port_list(port_list);
 
-  // Initialize message queue and threads
-  return initialize_serial_thread();
+  if (g_count == 0 && verbose) {
+    SDL_LogError(SDL_LOG_CATEGORY_SYSTEM, "Cannot find a M8");
+  }
+  return g_count;
 }
 
-static int send_ping() {
+static int send_ping(const m8_device_s *d) {
   SDL_LogDebug(SDL_LOG_CATEGORY_SYSTEM, "Sending ping");
   const unsigned char buf[1] = {'X'};
-  const size_t nbytes = 1;
-  const int result = sp_blocking_write(m8_port, buf, nbytes, 5);
-  if (result != nbytes) {
+  const int result = sp_blocking_write(d->port, buf, 1, 5);
+  if (result != 1) {
     SDL_LogError(SDL_LOG_CATEGORY_SYSTEM, "Error sending ping, code %d", result);
     return 0;
   }
   return 1;
 }
 
-int m8_send_msg_controller(const uint8_t input) {
-  SDL_LogDebug(SDL_LOG_CATEGORY_SYSTEM, "Sending controller input %d", input);
+int m8_send_msg_controller(const int dev, const uint8_t input) {
+  if (dev < 0 || dev >= g_count || g_dev[dev].port == NULL)
+    return -1;
   const unsigned char buf[2] = {'C', input};
-  const size_t nbytes = 2;
-  const int result = sp_blocking_write(m8_port, buf, nbytes, 5);
-  if (result != nbytes) {
+  const int result = sp_blocking_write(g_dev[dev].port, buf, 2, 5);
+  if (result != 2) {
     SDL_LogError(SDL_LOG_CATEGORY_SYSTEM, "Error sending input, code %d", result);
     return -1;
   }
   return 1;
 }
 
-int m8_send_msg_keyjazz(const uint8_t note, uint8_t velocity) {
+int m8_send_msg_keyjazz(const int dev, const uint8_t note, uint8_t velocity) {
+  if (dev < 0 || dev >= g_count || g_dev[dev].port == NULL)
+    return -1;
 
-  // Cap velocity to 7bits
   if (velocity > 0x7F)
     velocity = 0x7F;
 
   // Special case for note off
   if (note == 0xFF && velocity == 0x00) {
-    SDL_LogDebug(SDL_LOG_CATEGORY_SYSTEM, "Sending keyjazz note off");
     const unsigned char buf[2] = {'K', 0xFF};
-    const size_t nbytes = 2;
-    const int result = sp_blocking_write(m8_port, buf, nbytes, 5);
-    if (result != nbytes) {
+    const int result = sp_blocking_write(g_dev[dev].port, buf, 2, 5);
+    if (result != 2) {
       SDL_LogError(SDL_LOG_CATEGORY_SYSTEM, "Error sending keyjazz, code %d", result);
       return -1;
     }
@@ -317,15 +323,12 @@ int m8_send_msg_keyjazz(const uint8_t note, uint8_t velocity) {
   }
 
   // Regular note on message
-  SDL_LogDebug(SDL_LOG_CATEGORY_SYSTEM, "Sending keyjazz note %d, velocity %d", note, velocity);
   const unsigned char buf[3] = {'K', note, velocity};
-  const size_t nbytes = 3;
-  const int result = sp_blocking_write(m8_port, buf, nbytes, 5);
-  if (result != nbytes) {
+  const int result = sp_blocking_write(g_dev[dev].port, buf, 3, 5);
+  if (result != 3) {
     SDL_LogError(SDL_LOG_CATEGORY_SYSTEM, "Error sending keyjazz, code %d", result);
     return -1;
   }
-
   return 1;
 }
 
@@ -356,11 +359,12 @@ int m8_list_devices() {
   return 0;
 }
 
-int m8_reset_display() {
-  SDL_Log("Reset display");
-
+int m8_reset_display(const int dev) {
+  if (dev < 0 || dev >= g_count || g_dev[dev].port == NULL)
+    return 0;
+  SDL_Log("Reset display (device %d)", dev);
   const unsigned char buf[1] = {'R'};
-  const int result = sp_blocking_write(m8_port, buf, 1, 5);
+  const int result = sp_blocking_write(g_dev[dev].port, buf, 1, 5);
   if (result != 1) {
     SDL_LogError(SDL_LOG_CATEGORY_SYSTEM, "Error resetting M8 display, code %d", result);
     return 0;
@@ -368,11 +372,13 @@ int m8_reset_display() {
   return 1;
 }
 
-int m8_enable_display(const unsigned char reset_display) {
-  SDL_Log("Enabling and resetting M8 display");
+int m8_enable_display(const int dev, const unsigned char reset_display) {
+  if (dev < 0 || dev >= g_count || g_dev[dev].port == NULL)
+    return 0;
+  SDL_Log("Enabling and resetting M8 display (device %d)", dev);
 
   const char buf_enable[1] = {'E'};
-  int result = sp_blocking_write(m8_port, buf_enable, 1, 5);
+  int result = sp_blocking_write(g_dev[dev].port, buf_enable, 1, 5);
   if (result != 1) {
     SDL_LogError(SDL_LOG_CATEGORY_SYSTEM, "Error enabling M8 display, code %d", result);
     return 0;
@@ -382,23 +388,23 @@ int m8_enable_display(const unsigned char reset_display) {
   SDL_Delay(500);
 
   if (reset_display) {
-    result = m8_reset_display();
+    result = m8_reset_display(dev);
   }
 
   return result;
 }
 
-int m8_process_data(const config_params_s *conf) {
-  static unsigned int empty_cycles = 0;
+int m8_process_data(const int dev, const config_params_s *conf) {
+  static unsigned int empty_cycles[M8_MAX_DEVICES] = {0};
   static message_batch_s batch;
 
-  // Device likely has been disconnected
-  if (m8_port == NULL) {
+  if (dev < 0 || dev >= g_count || g_dev[dev].port == NULL) {
     return DEVICE_DISCONNECTED;
   }
+  m8_device_s *d = &g_dev[dev];
 
-  if (pop_all_messages(&queue, &batch) > 0) {
-    empty_cycles = 0;
+  if (pop_all_messages(&d->queue, &batch) > 0) {
+    empty_cycles[dev] = 0;
     for (unsigned int i = 0; i < batch.count; i++) {
       if (batch.lengths[i] > 0) {
         process_command(batch.messages[i], batch.lengths[i]);
@@ -406,32 +412,35 @@ int m8_process_data(const config_params_s *conf) {
       SDL_free(batch.messages[i]);
     }
   } else {
-    empty_cycles++;
-    if (empty_cycles >= conf->wait_packets) {
-      // try opening the serial port to check if it's alive
-      if (serial_port_connected()) {
-        // check if the device responds to display reset
-        if (!send_ping()) {
+    empty_cycles[dev]++;
+    if (empty_cycles[dev] >= conf->wait_packets) {
+      // try checking if the device is still alive
+      if (serial_port_connected(d)) {
+        if (!send_ping(d)) {
           SDL_LogError(SDL_LOG_CATEGORY_SYSTEM, "Failed to ping device on reconnect");
-          disconnect();
+          disconnect_device(d);
           return DEVICE_DISCONNECTED;
         }
-        // the device is still there, carry on
-        empty_cycles = 0;
+        empty_cycles[dev] = 0;
         return DEVICE_PROCESSING;
       }
       SDL_LogError(SDL_LOG_CATEGORY_SYSTEM,
                    "No messages received for %d cycles, assuming device disconnected",
-                   empty_cycles);
-      empty_cycles = 0;
-      disconnect();
+                   empty_cycles[dev]);
+      empty_cycles[dev] = 0;
+      disconnect_device(d);
       return DEVICE_DISCONNECTED;
     }
   }
   return DEVICE_PROCESSING;
 }
 
-int m8_close() { return disconnect(); }
+int m8_close() {
+  for (int i = 0; i < g_count; i++)
+    disconnect_device(&g_dev[i]);
+  g_count = 0;
+  return 1;
+}
 
 // These shouldn't be needed with serial
 int m8_pause_processing(void) { return 1; }

@@ -18,8 +18,17 @@ extern "C" {
 
 #define JUCE_HOST_NUM_SENDS 3
 #define JUCE_HOST_BUS_MASTER 3   // bus id of the master chain
-#define JUCE_HOST_NUM_BUSES 4
 #define JUCE_HOST_NUM_TRACKS 8
+#define JUCE_HOST_NUM_FXRET 3    // M8 FX returns (modfx/delay/reverb)
+// Per-output insert chains: one dedicated FX chain per M8 audio output.
+// Buses 4..11 = track inserts 1-8; 12..14 = FX-return inserts. See
+// docs/per-output-inserts.md.
+#define JUCE_HOST_INSERT_BASE 4
+#define JUCE_HOST_NUM_INSERTS (JUCE_HOST_NUM_TRACKS + JUCE_HOST_NUM_FXRET) // 11
+#define JUCE_HOST_NUM_BUSES (JUCE_HOST_INSERT_BASE + JUCE_HOST_NUM_INSERTS) // 15
+// bus id of track t's insert (t = 0..7) / FX return f's insert (f = 0..2):
+#define JUCE_HOST_TRACK_INSERT(t) (JUCE_HOST_INSERT_BASE + (t))
+#define JUCE_HOST_FXRET_INSERT(f) (JUCE_HOST_INSERT_BASE + JUCE_HOST_NUM_TRACKS + (f))
 
 // If this process was relaunched as the isolated plugin-scanner worker,
 // runs the worker loop and never returns (exits the process). Otherwise
@@ -66,6 +75,10 @@ void juce_host_clock(void);                       // one MIDI clock pulse (0xF8)
 void juce_host_transport(bool playing, bool reset); // start(reset)/continue/stop
 int  juce_host_transport_playing(void);           // 1 if transport running
 double juce_host_bpm(void);                        // current tempo estimate
+// Capture-latency compensation (samples) so playhead-driven plugins align with
+// the M8's captured audio. Returns the value actually set.
+int  juce_host_set_playhead_offset(int samples);
+int  juce_host_playhead_offset(void);
 
 // --- Per-slot quick params: 3 plugin parameters exposed as macros, each
 //     assignable from the parameter list or via MIDI-learn (bind a CC). ---

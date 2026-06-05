@@ -41,4 +41,14 @@ bool m8_capture_has_output(void);
 // caller's own path (on=false). No-op if the device has no output.
 void m8_capture_set_monitor_duplex(bool on);
 
+// --- Secondary capture: a second M8 (e.g. a headless) stereo input ---
+// Auto-detects a second "M8" input device (>=2 ch) distinct from the primary,
+// and streams its stereo through a lock-free ring. Returns false if none.
+bool m8_capture2_start(void);
+void m8_capture2_stop(void);
+bool m8_capture2_active(void);
+// Pop up to `frames` interleaved stereo frames (out holds frames*2 floats).
+// Returns the number of stereo frames written (may be < frames on drift).
+int m8_capture2_read(float *out, int frames);
+
 #endif
