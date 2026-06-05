@@ -25,8 +25,11 @@ static const char *BUS_NAMES[JUCE_HOST_NUM_BUSES] = {
 // Left-to-right display order (console flow): tracks, FX returns, sends, master.
 static const int DISPLAY_ORDER[JUCE_HOST_NUM_BUSES] = {
     4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 0, 1, 2, 3};
-#define RACK_VISIBLE_COLS 8 // columns shown at once (all 8 tracks fit; strip scrolls for FX/sends/master)
-#define RACK_SS 2 // overlay supersampling: render at SS× the M8 texture for smaller, crisp text
+// Rack grid: 4 columns x 2 rows = 8 cells per page (the 8 tracks fit on page 1).
+#define RACK_COLS 4
+#define RACK_ROWS 2
+#define RACK_PER_PAGE (RACK_COLS * RACK_ROWS)
+#define RACK_SS 1.5f // overlay supersampling: render at SS× the M8 texture (crisper, tunable size)
 
 static int display_pos(int bus) {
   for (int i = 0; i < JUCE_HOST_NUM_BUSES; i++)
@@ -522,51 +525,57 @@ static void hl_bar(SDL_Renderer *rend, int x, int y, int w) {
 static void render_rack(SDL_Renderer *rend, int tw, int th) {
   const Uint32 fg = 0xFFFFFF, sel = 0x00FFFF, title = 0xFF0000, dim = 0x888888, hdr = 0xAAAAFF;
   const int gx = (int)fonts_get(0)->glyph_x;
-  const int col_w = tw / RACK_VISIBLE_COLS;
-  const int chars = (col_w - 2) / (gx > 0 ? gx : 6);
+  const int cell_w = tw / RACK_COLS;
+  const int chars = (cell_w - 2) / (gx > 0 ? gx : 6);
 
-  // Horizontal scroll: keep the selected column inside the visible window.
+  // Page of RACK_PER_PAGE (4x2) buses containing the selection. Page 1 = the
+  // 8 tracks; page 2 = FX returns + sends + master.
   const int selpos = display_pos(g.sel_bus);
-  int first = selpos - RACK_VISIBLE_COLS + 1;
-  if (first < 0) first = 0;
-  if (first > JUCE_HOST_NUM_BUSES - RACK_VISIBLE_COLS)
-    first = JUCE_HOST_NUM_BUSES - RACK_VISIBLE_COLS;
-  if (selpos < first) first = selpos;
+  const int page = selpos / RACK_PER_PAGE;
+  const int first = page * RACK_PER_PAGE;
+  const int npages = (JUCE_HOST_NUM_BUSES + RACK_PER_PAGE - 1) / RACK_PER_PAGE;
 
   {
     char rt[96];
-    SDL_snprintf(rt, sizeof(rt), "RACKS [%s]  %d/%d %s", g.cur_song[0] ? g.cur_song : "no song",
-                 selpos + 1, JUCE_HOST_NUM_BUSES,
-                 (first > 0 ? (first + RACK_VISIBLE_COLS < JUCE_HOST_NUM_BUSES ? "<>" : "<")
-                            : (JUCE_HOST_NUM_BUSES > RACK_VISIBLE_COLS ? ">" : "")));
+    SDL_snprintf(rt, sizeof(rt), "RACKS [%s]  page %d/%d  L/R bus", g.cur_song[0] ? g.cur_song : "no song",
+                 page + 1, npages);
     inprint(rend, rt, MARGIN, MARGIN, title, title);
   }
 
-  const int top = MARGIN + LINE_H + 2;
-  for (int col = 0; col < RACK_VISIBLE_COLS; col++) {
-    const int b = DISPLAY_ORDER[first + col];
-    int x = col * col_w + 2;
-    int y = top;
+  const int grid_top = MARGIN + LINE_H + 2;
+  const int footer = LINE_H * 7;                       // reserved for params + hints
+  const int cell_h = (th - grid_top - footer) / RACK_ROWS;
+  const int slots_fit = cell_h / LINE_H - 2;           // minus the 2 header lines
+
+  for (int cell = 0; cell < RACK_PER_PAGE; cell++) {
+    const int idx = first + cell;
+    if (idx >= JUCE_HOST_NUM_BUSES)
+      break;
+    const int b = DISPLAY_ORDER[idx];
+    const int cx = (cell % RACK_COLS) * cell_w + 2;
+    const int cy = grid_top + (cell / RACK_COLS) * cell_h;
+    int y = cy;
     const Uint32 hc = (b == g.sel_bus) ? sel : hdr;
-    inprint(rend, BUS_NAMES[b], x, y, hc, 0);
+    inprint(rend, BUS_NAMES[b], cx, y, hc, 0);
     y += LINE_H;
     // 2nd header line: role / MIDI channel + M8 send CC.
-    // Compact sub-label (must fit a narrow column, ~7 chars).
     char sub[24];
     if (b < JUCE_HOST_NUM_SENDS) {
       int mc = juce_host_bus_midi_channel(b);
-      if (mc > 0) SDL_snprintf(sub, sizeof(sub), "CC%d c%d", 20 + b, mc);
+      if (mc > 0) SDL_snprintf(sub, sizeof(sub), "CC%d ch%d", 20 + b, mc);
       else SDL_snprintf(sub, sizeof(sub), "CC%d", 20 + b);
     } else if (b == JUCE_HOST_BUS_MASTER) {
-      SDL_snprintf(sub, sizeof(sub), "out");
+      SDL_snprintf(sub, sizeof(sub), "mix out");
     } else if (b < JUCE_HOST_INSERT_BASE + JUCE_HOST_NUM_TRACKS) {
-      SDL_snprintf(sub, sizeof(sub), "in");
+      SDL_snprintf(sub, sizeof(sub), "track in");
     } else {
       SDL_snprintf(sub, sizeof(sub), "fx in");
     }
-    inprint(rend, sub, x, y, dim, 0);
+    inprint(rend, sub, cx, y, dim, 0);
     y += LINE_H;
     int cap = juce_host_bus_capacity(b);
+    if (cap > slots_fit)
+      cap = slots_fit; // don't overflow the cell
     int n = juce_host_bus_slot_count(b);
     for (int s = 0; s < cap; s++) {
       char name[64] = {0}, line[80];
@@ -580,10 +589,10 @@ static void render_rack(SDL_Renderer *rend, int tw, int th) {
         SDL_snprintf(line, sizeof(line), " ----");
       }
       if (is_sel)
-        hl_bar(rend, x - 2, y, col_w - 2);
+        hl_bar(rend, cx - 2, y, cell_w - 2);
       Uint32 c = is_sel ? 0x000000
                         : (s < n ? (juce_host_slot_is_bypassed(b, s) ? dim : fg) : dim);
-      inprint(rend, line, x, y, c, 0);
+      inprint(rend, line, cx, y, c, 0);
       y += LINE_H;
     }
   }
@@ -759,8 +768,8 @@ void plugin_rack_render_overlay(SDL_Renderer *rend, int texture_w, int texture_h
   // Supersample the overlay: render it at RACK_SS× the M8 texture size, then let
   // it scale down to the window. The 5px bitmap font (the smallest we have) thus
   // appears physically smaller AND stays crisp, so long plugin names fit.
-  const int sw = texture_w * RACK_SS;
-  const int sh = texture_h * RACK_SS;
+  const int sw = (int)(texture_w * RACK_SS);
+  const int sh = (int)(texture_h * RACK_SS);
   if (g.texture != NULL) {
     float gw = 0, gh = 0;
     SDL_GetTextureSize(g.texture, &gw, &gh);
