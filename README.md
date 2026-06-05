@@ -71,9 +71,8 @@ the M8 stays the brain, and M8C is the studio that wraps around it — you barel
 | M8 **CC102** | Recall a saved song |
 | M8 transport / clock | Drives host transport + tempo (enable **SEND SYNC** on the M8) |
 
-> **Platform note:** the recorder, plugin host and duplex monitoring use **CoreAudio / Core MIDI** and are
-> **macOS-only** for now. The original cross-platform m8c display client is unchanged below. Build with CMake on
-> macOS; see [`docs/vst-host-architecture.md`](docs/vst-host-architecture.md) for the design.
+> See [`docs/vst-host-architecture.md`](docs/vst-host-architecture.md) for the design. The original
+> cross-platform m8c display client is unchanged below.
 
 -------
 
