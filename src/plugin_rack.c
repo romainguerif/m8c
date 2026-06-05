@@ -432,7 +432,16 @@ void plugin_rack_handle_event(struct app_context *ctx, const SDL_Event *e) {
       if (g.sel_slot[g.sel_bus] > 0) g.sel_slot[g.sel_bus]--;
       autosave();
     } else if (g.sel_slot[g.sel_bus] > 0) {
-      g.sel_slot[g.sel_bus]--;
+      g.sel_slot[g.sel_bus]--; // up within the chain
+    } else {
+      // at the top of the chain -> jump to the cell directly above (grid nav),
+      // entering it from the bottom.
+      int p = display_pos(g.sel_bus);
+      if (p - RACK_COLS >= 0) {
+        g.sel_bus = DISPLAY_ORDER[p - RACK_COLS];
+        g.sel_slot[g.sel_bus] = 9999;
+        clamp_slot();
+      }
     }
     break;
   case SDL_SCANCODE_DOWN: {
@@ -446,7 +455,18 @@ void plugin_rack_handle_event(struct app_context *ctx, const SDL_Event *e) {
     } else {
       int cap = juce_host_bus_capacity(g.sel_bus);
       int max = (n < cap) ? n : cap - 1;
-      if (g.sel_slot[g.sel_bus] < max) g.sel_slot[g.sel_bus]++;
+      if (g.sel_slot[g.sel_bus] < max) {
+        g.sel_slot[g.sel_bus]++; // down within the chain
+      } else {
+        // at the bottom of the chain -> jump to the cell directly below (grid
+        // nav), entering it from the top.
+        int p = display_pos(g.sel_bus);
+        if (p + RACK_COLS < JUCE_HOST_NUM_BUSES) {
+          g.sel_bus = DISPLAY_ORDER[p + RACK_COLS];
+          g.sel_slot[g.sel_bus] = 0;
+          clamp_slot();
+        }
+      }
     }
     break;
   }
