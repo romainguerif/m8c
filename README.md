@@ -4,8 +4,6 @@
 
 > **A fork of [laamaa/m8c](https://github.com/laamaa/m8c) that turns the M8 display client into a
 > multitrack recorder and an internal VST3/AU effects & instrument host — all driven from the M8 itself.**
->
-> Design & direction by Romain Guérif — code written by [Claude Code](https://claude.com/claude-code), on macOS.
 
 M8C keeps everything the original m8c does (mirror the Dirtywave M8 screen, control it from a keyboard/gamepad,
 route its audio) and adds a full production layer around it. The philosophy is *ultra-fluid, minimal-friction*:
