@@ -26,6 +26,7 @@ static const char *BUS_NAMES[JUCE_HOST_NUM_BUSES] = {
 static const int DISPLAY_ORDER[JUCE_HOST_NUM_BUSES] = {
     4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 0, 1, 2, 3};
 #define RACK_VISIBLE_COLS 8 // columns shown at once (all 8 tracks fit; strip scrolls for FX/sends/master)
+#define RACK_SS 2 // overlay supersampling: render at SS× the M8 texture for smaller, crisp text
 
 static int display_pos(int bus) {
   for (int i = 0; i < JUCE_HOST_NUM_BUSES; i++)
@@ -755,16 +756,28 @@ void plugin_rack_render_overlay(SDL_Renderer *rend, int texture_w, int texture_h
     inline_font_initialize(fonts_get(0));
   }
 
+  // Supersample the overlay: render it at RACK_SS× the M8 texture size, then let
+  // it scale down to the window. The 5px bitmap font (the smallest we have) thus
+  // appears physically smaller AND stays crisp, so long plugin names fit.
+  const int sw = texture_w * RACK_SS;
+  const int sh = texture_h * RACK_SS;
+  if (g.texture != NULL) {
+    float gw = 0, gh = 0;
+    SDL_GetTextureSize(g.texture, &gw, &gh);
+    if ((int)gw != sw || (int)gh != sh) { // size changed (model / dual toggle)
+      SDL_DestroyTexture(g.texture);
+      g.texture = NULL;
+    }
+  }
   if (g.texture == NULL) {
-    g.texture = SDL_CreateTexture(rend, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET,
-                                  texture_w, texture_h);
+    g.texture = SDL_CreateTexture(rend, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET, sw, sh);
     if (g.texture == NULL) {
       inline_font_close();
       inline_font_initialize(previous_font);
       return;
     }
     SDL_SetTextureBlendMode(g.texture, SDL_BLENDMODE_BLEND);
-    SDL_SetTextureScaleMode(g.texture, SDL_SCALEMODE_NEAREST);
+    SDL_SetTextureScaleMode(g.texture, SDL_SCALEMODE_LINEAR);
     g.needs_redraw = 1;
   }
 
@@ -776,13 +789,13 @@ void plugin_rack_render_overlay(SDL_Renderer *rend, int texture_w, int texture_h
   SDL_RenderClear(rend);
 
   if (g.mode == MODE_BROWSER)
-    render_browser(rend, texture_w, texture_h);
+    render_browser(rend, sw, sh);
   else if (g.mode == MODE_PARAMPICK)
-    render_parampick(rend, texture_w, texture_h);
+    render_parampick(rend, sw, sh);
   else if (g.mode == MODE_SONGS)
-    render_songs(rend, texture_w, texture_h);
+    render_songs(rend, sw, sh);
   else
-    render_rack(rend, texture_w, texture_h);
+    render_rack(rend, sw, sh);
 
   SDL_SetRenderTarget(rend, prev);
   SDL_RenderTexture(rend, g.texture, NULL, NULL);
