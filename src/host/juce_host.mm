@@ -27,6 +27,7 @@ namespace {
 constexpr int kMaxDelay = 16384; // PDC ring size (~371ms @44.1k)
 constexpr int kSendCap = 4;
 constexpr int kMasterCap = 8;
+constexpr int kInsertCap = 8; // per-output insert chain depth
 
 // ---- A simple per-channel delay line for PDC alignment ----
 struct DelayLine {
@@ -209,20 +210,25 @@ struct HostPlayHead : public juce::AudioPlayHead {
 HostPlayHead g_playhead;
 
 // ---- helpers (must hold g_lock) ----
+// Sum of non-bypassed slot latencies for one bus (also stores it on the bus).
+static int bus_latency_locked(int b) {
+  int lat = 0;
+  for (auto &s : g_buses[b].slots)
+    if (!s.bypassed) lat += s.latency;
+  g_buses[b].latency = lat;
+  return lat;
+}
+
 void recompute_latency_locked() {
+  // Two-stage PDC for the console model: inserts -> sends -> master.
+  int maxInsert = 0;
+  for (int b = JUCE_HOST_INSERT_BASE; b < JUCE_HOST_NUM_BUSES; b++)
+    maxInsert = juce::jmax(maxInsert, bus_latency_locked(b));
   int maxSend = 0;
-  for (int b = 0; b < JUCE_HOST_NUM_SENDS; b++) {
-    int lat = 0;
-    for (auto &s : g_buses[b].slots)
-      if (!s.bypassed) lat += s.latency;
-    g_buses[b].latency = lat;
-    maxSend = juce::jmax(maxSend, lat);
-  }
-  int masterLat = 0;
-  for (auto &s : g_buses[JUCE_HOST_BUS_MASTER].slots)
-    if (!s.bypassed) masterLat += s.latency;
-  g_buses[JUCE_HOST_BUS_MASTER].latency = masterLat;
-  g_totalLatency = maxSend + masterLat;
+  for (int b = 0; b < JUCE_HOST_NUM_SENDS; b++)
+    maxSend = juce::jmax(maxSend, bus_latency_locked(b));
+  const int masterLat = bus_latency_locked(JUCE_HOST_BUS_MASTER);
+  g_totalLatency = maxInsert + maxSend + masterLat;
 }
 
 void prepare_plugin_locked(Slot &s) {
@@ -283,8 +289,14 @@ extern "C" void juce_host_init(void) {
     }
   }
   for (int b = 0; b < JUCE_HOST_NUM_BUSES; b++) {
-    g_buses[b].capacity = (b == JUCE_HOST_BUS_MASTER) ? kMasterCap : kSendCap;
-    // Default: send 1/2/3 play MIDI on channels 1/2/3; master off.
+    if (b == JUCE_HOST_BUS_MASTER)
+      g_buses[b].capacity = kMasterCap;
+    else if (b >= JUCE_HOST_INSERT_BASE)
+      g_buses[b].capacity = kInsertCap; // per-output insert chains
+    else
+      g_buses[b].capacity = kSendCap;
+    // Default: send 1/2/3 play MIDI on channels 1/2/3; master + inserts off
+    // (inserts process M8 audio, not MIDI instruments).
     g_buses[b].midi_channel = (b < JUCE_HOST_NUM_SENDS) ? (b + 1) : 0;
   }
   for (int t = 0; t < JUCE_HOST_NUM_TRACKS; t++)
@@ -1040,32 +1052,60 @@ extern "C" bool juce_host_process_full(const float *in24, int channels, int fram
     g_time_samples.store((long long)(ppq * 60.0 / (bpm > 0.0 ? bpm : 120.0) * sr));
   }
 
-  // Dry = master pair (ch 0,1).
-  g_dry.setSize(2, frames, false, false, true);
-  for (int i = 0; i < frames; i++) {
-    g_dry.getWritePointer(0)[i] = in24[i * channels + 0];
-    g_dry.getWritePointer(1)[i] = in24[i * channels + 1];
-  }
+  // The M8 must be in multichannel mode for per-output processing; otherwise we
+  // only have the stereo mix (ch 0,1) — fall back to passing that through master.
+  const bool multitrack = channels >= 4;
 
-  // Build + process the 3 send buses from track stems (ch 2..17).
+  // --- Stage 1: per-output insert chains (8 tracks + 3 FX returns) ---
+  // Each insert reads its M8 output pair, runs its chain, and is aligned to the
+  // longest insert so all post-insert outputs are time-coherent.
+  int maxInsert = 0;
+  for (int b = JUCE_HOST_INSERT_BASE; b < JUCE_HOST_NUM_BUSES; b++)
+    maxInsert = juce::jmax(maxInsert, g_buses[b].latency);
+
+  auto run_insert = [&](int busId, int chL, int chR) {
+    Bus &bus = g_buses[busId];
+    bus.buf.setSize(2, frames, false, false, true);
+    if (multitrack && chR < channels) {
+      float *l = bus.buf.getWritePointer(0);
+      float *r = bus.buf.getWritePointer(1);
+      for (int i = 0; i < frames; i++) {
+        l[i] = in24[i * channels + chL];
+        r[i] = in24[i * channels + chR];
+      }
+    } else {
+      bus.buf.clear();
+    }
+    juce::MidiBuffer midi; // inserts process M8 audio, no MIDI
+    run_chain_locked(bus, bus.buf, midi);
+    bus.align.setDelay(maxInsert - bus.latency);
+    bus.align.process(bus.buf);
+  };
+  for (int t = 0; t < JUCE_HOST_NUM_TRACKS; t++)
+    run_insert(JUCE_HOST_TRACK_INSERT(t), 2 + 2 * t, 3 + 2 * t);
+  for (int f = 0; f < JUCE_HOST_NUM_FXRET; f++)
+    run_insert(JUCE_HOST_FXRET_INSERT(f), 18 + 2 * f, 19 + 2 * f);
+
+  // --- Stage 2: send buses, fed from the post-insert tracks ---
   int maxSend = 0;
   for (int b = 0; b < JUCE_HOST_NUM_SENDS; b++)
     maxSend = juce::jmax(maxSend, g_buses[b].latency);
 
   for (int b = 0; b < JUCE_HOST_NUM_SENDS; b++) {
     Bus &bus = g_buses[b];
-    bus.buf.setSize(2, frames, false, false, true); // logical length = frames, no realloc
+    bus.buf.setSize(2, frames, false, false, true);
     bus.buf.clear();
     float *l = bus.buf.getWritePointer(0);
     float *r = bus.buf.getWritePointer(1);
     for (int t = 0; t < JUCE_HOST_NUM_TRACKS; t++) {
       const float g = g_send[t][b].load();
       if (g <= 0.0f) continue;
-      const int cl = 2 + 2 * t, cr = 3 + 2 * t;
-      if (cr >= channels) break;
+      const juce::AudioBuffer<float> &tb = g_buses[JUCE_HOST_TRACK_INSERT(t)].buf;
+      const float *tl = tb.getReadPointer(0);
+      const float *tr = tb.getReadPointer(1);
       for (int i = 0; i < frames; i++) {
-        l[i] += in24[i * channels + cl] * g;
-        r[i] += in24[i * channels + cr] * g;
+        l[i] += tl[i] * g;
+        r[i] += tr[i] * g;
       }
     }
     // Drain queued MIDI for this lane with sample-accurate timing in the block.
@@ -1088,7 +1128,25 @@ extern "C" bool juce_host_process_full(const float *in24, int channels, int fram
     }
   }
 
-  // Align dry to the longest send path, then sum into master input.
+  // --- Master input = Σ(insert outputs) + Σ(sends) ---
+  // Sum the post-insert outputs (all at maxInsert) into the dry bus; with no
+  // multichannel feed, fall back to the M8 stereo mix so we never go silent.
+  g_dry.setSize(2, frames, false, false, true);
+  g_dry.clear();
+  if (multitrack) {
+    for (int b = JUCE_HOST_INSERT_BASE; b < JUCE_HOST_NUM_BUSES; b++) {
+      g_dry.addFrom(0, 0, g_buses[b].buf, 0, 0, frames);
+      g_dry.addFrom(1, 0, g_buses[b].buf, 1, 0, frames);
+    }
+  } else {
+    float *l = g_dry.getWritePointer(0);
+    float *r = g_dry.getWritePointer(1);
+    for (int i = 0; i < frames; i++) {
+      l[i] = in24[i * channels + 0];
+      r[i] = (channels > 1) ? in24[i * channels + 1] : in24[i * channels + 0];
+    }
+  }
+  // Delay the dry sum to align with the (later) send outputs.
   g_dryDelay.setDelay(maxSend);
   g_dryDelay.process(g_dry);
 
