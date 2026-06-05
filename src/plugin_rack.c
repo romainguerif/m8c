@@ -29,7 +29,10 @@ static const int DISPLAY_ORDER[JUCE_HOST_NUM_BUSES] = {
 #define RACK_COLS 4
 #define RACK_ROWS 2
 #define RACK_PER_PAGE (RACK_COLS * RACK_ROWS)
-#define RACK_SS 1.5f // overlay supersampling: render at SS× the M8 texture (crisper, tunable size)
+// Render the overlay at the M8's native texture resolution (1:1) so it scales
+// to the window EXACTLY like the M8 screen — pixel-perfect, no resampling blur.
+#define RACK_SS 1
+#define CELL_LH 8 // tighter line height inside grid cells (glyph is 5x7) -> more slots fit
 
 static int display_pos(int bus) {
   for (int i = 0; i < JUCE_HOST_NUM_BUSES; i++)
@@ -515,10 +518,10 @@ static void trunc_copy(char *dst, const char *src, int maxchars) {
   dst[i] = '\0';
 }
 
-// Draw a solid highlight bar (selection cursor) at a row.
-static void hl_bar(SDL_Renderer *rend, int x, int y, int w) {
+// Draw a solid highlight bar (selection cursor) at a row of height h.
+static void hl_bar(SDL_Renderer *rend, int x, int y, int w, int h) {
   SDL_SetRenderDrawColor(rend, 0x00, 0xC0, 0xFF, 0xFF); // bright cyan-blue
-  SDL_FRect r = {(float)x, (float)(y - 1), (float)w, (float)LINE_H};
+  SDL_FRect r = {(float)x, (float)(y - 1), (float)w, (float)h};
   SDL_RenderFillRect(rend, &r);
 }
 
@@ -545,7 +548,7 @@ static void render_rack(SDL_Renderer *rend, int tw, int th) {
   const int grid_top = MARGIN + LINE_H + 2;
   const int footer = LINE_H * 7;                       // reserved for params + hints
   const int cell_h = (th - grid_top - footer) / RACK_ROWS;
-  const int slots_fit = cell_h / LINE_H - 2;           // minus the 2 header lines
+  const int slots_fit = cell_h / CELL_LH - 2;          // minus the 2 header lines
 
   for (int cell = 0; cell < RACK_PER_PAGE; cell++) {
     const int idx = first + cell;
@@ -557,7 +560,7 @@ static void render_rack(SDL_Renderer *rend, int tw, int th) {
     int y = cy;
     const Uint32 hc = (b == g.sel_bus) ? sel : hdr;
     inprint(rend, BUS_NAMES[b], cx, y, hc, 0);
-    y += LINE_H;
+    y += CELL_LH;
     // 2nd header line: role / MIDI channel + M8 send CC.
     char sub[24];
     if (b < JUCE_HOST_NUM_SENDS) {
@@ -572,7 +575,7 @@ static void render_rack(SDL_Renderer *rend, int tw, int th) {
       SDL_snprintf(sub, sizeof(sub), "fx in");
     }
     inprint(rend, sub, cx, y, dim, 0);
-    y += LINE_H;
+    y += CELL_LH;
     int cap = juce_host_bus_capacity(b);
     if (cap > slots_fit)
       cap = slots_fit; // don't overflow the cell
@@ -589,11 +592,11 @@ static void render_rack(SDL_Renderer *rend, int tw, int th) {
         SDL_snprintf(line, sizeof(line), " ----");
       }
       if (is_sel)
-        hl_bar(rend, cx - 2, y, cell_w - 2);
+        hl_bar(rend, cx - 2, y, cell_w - 2, CELL_LH);
       Uint32 c = is_sel ? 0x000000
                         : (s < n ? (juce_host_slot_is_bypassed(b, s) ? dim : fg) : dim);
       inprint(rend, line, cx, y, c, 0);
-      y += LINE_H;
+      y += CELL_LH;
     }
   }
 
@@ -623,7 +626,7 @@ static void render_rack(SDL_Renderer *rend, int tw, int th) {
         SDL_snprintf(qline, sizeof(qline), "Q%d %-18s %3d%%  %s", q + 1, pn,
                      (int)(v * 100.0f + 0.5f), ccb);
         const bool qs = (g.focus && q == g.params_sel);
-        if (qs) hl_bar(rend, 0, sy, tw);
+        if (qs) hl_bar(rend, 0, sy, tw, LINE_H);
         inprint(rend, qline, MARGIN, sy, qs ? 0x000000 : fg, 0);
         sy += LINE_H;
       }
@@ -678,7 +681,7 @@ static void render_browser(SDL_Renderer *rend, int tw, int th) {
     const int y = top + i * LINE_H;
     const bool selrow = (idx == g.browser_sel);
     if (selrow)
-      hl_bar(rend, 0, y, tw);
+      hl_bar(rend, 0, y, tw, LINE_H);
     inprint(rend, line, MARGIN, y, selrow ? 0x000000 : fg, 0);
   }
 
@@ -708,7 +711,7 @@ static void render_parampick(SDL_Renderer *rend, int tw, int th) {
     trunc_copy(line, raw, maxchars);
     const int y = top + i * LINE_H;
     const bool selrow = (idx == g.pick_sel);
-    if (selrow) hl_bar(rend, 0, y, tw);
+    if (selrow) hl_bar(rend, 0, y, tw, LINE_H);
     inprint(rend, line, MARGIN, y, selrow ? 0x000000 : fg, 0);
   }
   inprint(rend, "Up/Down (Shift=fast)  Enter=assign  Esc=back", MARGIN, th - LINE_H, dim, 0);
@@ -749,7 +752,7 @@ static void render_songs(SDL_Renderer *rend, int tw, int th) {
     trunc_copy(line, g.song_names[idx], maxchars);
     const int y = top + i * LINE_H;
     const bool selrow = (idx == g.song_sel);
-    if (selrow) hl_bar(rend, 0, y, tw);
+    if (selrow) hl_bar(rend, 0, y, tw, LINE_H);
     inprint(rend, line, MARGIN, y, selrow ? 0x000000 : fg, 0);
   }
   inprint(rend, "Up/Dn  Enter=load  N=new  X=del  Esc=back", MARGIN, th - LINE_H, dim, 0);
@@ -786,7 +789,7 @@ void plugin_rack_render_overlay(SDL_Renderer *rend, int texture_w, int texture_h
       return;
     }
     SDL_SetTextureBlendMode(g.texture, SDL_BLENDMODE_BLEND);
-    SDL_SetTextureScaleMode(g.texture, SDL_SCALEMODE_LINEAR);
+    SDL_SetTextureScaleMode(g.texture, SDL_SCALEMODE_NEAREST); // pixel-perfect
     g.needs_redraw = 1;
   }
 
