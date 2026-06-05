@@ -25,7 +25,7 @@ static const char *BUS_NAMES[JUCE_HOST_NUM_BUSES] = {
 // Left-to-right display order (console flow): tracks, FX returns, sends, master.
 static const int DISPLAY_ORDER[JUCE_HOST_NUM_BUSES] = {
     4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 0, 1, 2, 3};
-#define RACK_VISIBLE_COLS 4 // columns shown at once (strip scrolls horizontally)
+#define RACK_VISIBLE_COLS 8 // columns shown at once (all 8 tracks fit; strip scrolls for FX/sends/master)
 
 static int display_pos(int bus) {
   for (int i = 0; i < JUCE_HOST_NUM_BUSES; i++)
@@ -125,6 +125,11 @@ static void load_song(const char *name) {
 }
 
 void plugin_rack_toggle_open(void) {
+  static int inited = 0;
+  if (!inited) { // first open lands on the tracks page (TRK 1)
+    g.sel_bus = JUCE_HOST_INSERT_BASE;
+    inited = 1;
+  }
   g.is_open = !g.is_open;
   if (g.is_open) {
     g.mode = MODE_RACK;
@@ -545,15 +550,16 @@ static void render_rack(SDL_Renderer *rend, int tw, int th) {
     inprint(rend, BUS_NAMES[b], x, y, hc, 0);
     y += LINE_H;
     // 2nd header line: role / MIDI channel + M8 send CC.
+    // Compact sub-label (must fit a narrow column, ~7 chars).
     char sub[24];
     if (b < JUCE_HOST_NUM_SENDS) {
       int mc = juce_host_bus_midi_channel(b);
-      if (mc > 0) SDL_snprintf(sub, sizeof(sub), "ch%d CC%d", mc, 20 + b);
-      else SDL_snprintf(sub, sizeof(sub), "ch- CC%d", 20 + b);
+      if (mc > 0) SDL_snprintf(sub, sizeof(sub), "CC%d c%d", 20 + b, mc);
+      else SDL_snprintf(sub, sizeof(sub), "CC%d", 20 + b);
     } else if (b == JUCE_HOST_BUS_MASTER) {
-      SDL_snprintf(sub, sizeof(sub), "mix out");
+      SDL_snprintf(sub, sizeof(sub), "out");
     } else if (b < JUCE_HOST_INSERT_BASE + JUCE_HOST_NUM_TRACKS) {
-      SDL_snprintf(sub, sizeof(sub), "track in");
+      SDL_snprintf(sub, sizeof(sub), "in");
     } else {
       SDL_snprintf(sub, sizeof(sub), "fx in");
     }
